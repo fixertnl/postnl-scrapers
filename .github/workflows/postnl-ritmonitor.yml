@@ -1,0 +1,28 @@
+name: PostNL Ritmonitor
+
+# Getriggerd door Supabase pg_cron via de GitHub API (workflow_dispatch).
+# NOOIT on: schedule gebruiken — dat vuurt minuten tot uren te laat.
+on:
+  workflow_dispatch:
+
+jobs:
+  ritmonitor:
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.50.0-noble
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installeer dependencies
+        working-directory: worker/postnl-ritmonitor
+        run: npm install --omit=dev
+
+      - name: Ritmonitor sync
+        working-directory: worker/postnl-ritmonitor
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CREDENTIALS_ENCRYPTION_KEY: ${{ secrets.CREDENTIALS_ENCRYPTION_KEY }}
+          KLANT_ID: ${{ secrets.KLANT_ID }}
+          POSTNL_HEADLESS: 'true'
+        run: node src/index.js --once

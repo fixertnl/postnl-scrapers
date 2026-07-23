@@ -1,0 +1,17 @@
+{
+  "name": "postnl-stops-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "sync:once": "node src/index.js --once",
+    "playwright:install": "playwright install chromium"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "playwright": "^1.50.0"
+  }
+}
