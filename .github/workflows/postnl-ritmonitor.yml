@@ -13,7 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # node_modules cachen zodat npm install niet elke run opnieuw downloadt.
+      - name: Cache dependencies
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: worker/postnl-ritmonitor/node_modules
+          key: ritmonitor-node-${{ hashFiles('worker/postnl-ritmonitor/package.json') }}
+
       - name: Installeer dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
         working-directory: worker/postnl-ritmonitor
         run: npm install --omit=dev
 
