@@ -62,12 +62,12 @@ async function loginPostnl(page, depot) {
   await page.locator('input[type="text"], input[type="email"]').first().fill(depot.username)
   await page.locator('input[type="password"]').first().fill(depot.password)
   await page.locator('button[data-trn-key="login.butlogin"]').click()
-  try {
-    await page.waitForURL('**pnl-oompd**', { timeout: 90000 })
-  } catch {
-    throw new Error(`Login redirect mislukt. URL na login: ${page.url()}`)
-  }
+  // Wacht tot we van de loginpagina af zijn. NIET op '**pnl-oompd**' wachten:
+  // de login-URL bevat die string zelf (in de redirect-param) → vals-positief,
+  // en op sommige runners (GitHub Actions) mist waitForURL de OAuth-redirect.
+  await page.waitForFunction(() => !window.location.hostname.includes('loginpostnl'), { timeout: 90000 }).catch(() => {})
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {})
+  if (page.url().includes('loginpostnl')) throw new Error(`Login mislukt. URL na login: ${page.url()}`)
   console.log(`[${depot.naam}] Ingelogd, URL:`, page.url())
 }
 
