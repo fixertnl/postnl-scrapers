@@ -215,7 +215,7 @@ async function leesRitmonitor(page) {
     })
 }
 
-async function opslaanMonitorInSupabase(rijen, datum, depotNaam, legeLijstBevestigd = false) {
+async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
   const nu = new Date().toISOString()
   const klantId = KLANT_ID
 
@@ -231,11 +231,17 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam, legeLijstBevest
     if (!bestaandeMap.has(key)) bestaandeMap.set(key, r)
   }
 
-  // Welke ritnummers zijn nu zichtbaar in de ritmonitor?
-  const inMonitorNu = new Set(rijen.map(r => r.ritnummer))
-
   const teUpdaten = []
   const teInserten = []
+  const logRijen = []
+  const runContext = {
+    klant_id: klantId,
+    depot: depotNaam,
+    datum,
+    rijen_gelezen: rijen.length,
+    lege_lijst_bevestigd: false,
+    bestaande_ritten: bestaande?.length ?? 0,
+  }
 
   for (const rit of rijen) {
     const existing = bestaandeMap.get(rit.ritnummer)
@@ -281,6 +287,20 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam, legeLijstBevest
       velden.postnl_eind_werktijd = nu
     }
 
+    // Diagnostisch loggen: wat las de worker + welke beslissing nam hij voor deze rit.
+    const actie = !existing ? 'nieuw'
+      : velden.postnl_eind_werktijd ? 'eind-nul'
+      : velden.postnl_start_werktijd ? 'start-gezet'
+      : 'gelezen'
+    logRijen.push({
+      ...runContext,
+      ritnummer:     rit.ritnummer,
+      stops_totaal:  rit.stopsTotaal,
+      stops_te_doen: rit.stopsTeDoen,
+      laatste_actie: rit.laatsteActie,
+      actie,
+    })
+
     if (existing) {
       teUpdaten.push({ id: existing.id, velden })
     } else {
@@ -298,40 +318,21 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam, legeLijstBevest
     }
   }
 
-  // Eindtijd: ritten die eerder in de ritmonitor stonden maar nu verdwenen zijn.
-  // Veiligheidscheck: alleen detecteren als de huidige sync minstens 1 rit
-  // terugstuurde, óf als een lege lijst dubbel bevestigd is (einde van de dag:
-  // wanneer de laatste chauffeurs zich afmelden loopt de monitor leeg — zonder
-  // deze uitzondering werd die laatste lichting nooit meer afgerond en bleef
-  // "X te gaan" eeuwig staan).
-  let aantalKlaar = 0
-  if (rijen.length > 0 || legeLijstBevestigd) {
-    const verdwenen = (bestaande ?? []).filter(r => {
-      const key = String(parseInt(r.ritnummer, 10))
-      return (
-        r.postnl_stops_totaal !== null &&   // was eerder gezien in ritmonitor
-        r.postnl_start_werktijd !== null && // was daadwerkelijk gestart
-        r.postnl_eind_werktijd === null &&  // nog geen eindtijd
-        !inMonitorNu.has(key)              // staat niet meer in ritmonitor
-      )
-    })
+  // Een rit wordt UITSLUITEND afgerond als we z'n "te doen = 0" daadwerkelijk
+  // (dubbel bevestigd) hebben gelezen — zie stopsTeDoenBevestigdNul hierboven.
+  // De oude "verdwenen uit grid → gereden"-detectie is bewust verwijderd: bij een
+  // gedeeltelijk geladen Mendix-grid verdwenen nog-bezige ritten uit de lijst en
+  // werden ze onterecht als klaar gemarkeerd (chauffeur nog onderweg).
 
-    for (const r of verdwenen) {
-      // Ook te_doen op 0: bij niet-bezorgbare stops (niet thuis/geweigerd) komt
-      // het portaal nooit op 0 uit — zonder reset blijft de rit in de app
-      // eeuwig op "bezig" staan met een restje "te gaan".
-      teUpdaten.push({ id: r.id, velden: { postnl_eind_werktijd: nu, postnl_stops_te_doen: 0, postnl_monitor_opgehaald: nu, status: 'gereden' } })
-    }
-    aantalKlaar = verdwenen.length
-    if (aantalKlaar > 0) console.log(`[${depotNaam}] Ritmonitor: ${aantalKlaar} rit(ten) klaar`)
-  }
+  console.log(`[${depotNaam}] Ritmonitor-run: ${rijen.length} gelezen, ${bestaande?.length ?? 0} bestaand`)
 
   await Promise.all([
     ...teUpdaten.map(({ id, velden }) => supabase.from('ritten').update(velden).eq('id', id)),
     teInserten.length ? supabase.from('ritten').insert(teInserten) : Promise.resolve(),
+    logRijen.length ? supabase.from('ritmonitor_log').insert(logRijen) : Promise.resolve(),
   ])
 
-  console.log(`[${depotNaam}] Ritmonitor ${datum}: bijgewerkt ${teUpdaten.length - aantalKlaar}, klaar ${aantalKlaar}, nieuw ${teInserten.length}`)
+  console.log(`[${depotNaam}] Ritmonitor ${datum}: bijgewerkt ${teUpdaten.length}, nieuw ${teInserten.length}`)
 }
 
 async function syncMonitorDepot(depot) {
@@ -342,18 +343,9 @@ async function syncMonitorDepot(depot) {
   try {
     await page.waitForTimeout(1000)
     await openRitmonitor(page, depot)
-    let rijen = await leesRitmonitor(page)
-    let legeLijstBevestigd = false
-    if (rijen.length === 0) {
-      // Lege lijst kan einde-van-de-dag zijn (iedereen afgemeld) óf een traag
-      // ladende Mendix-grid. Pas vertrouwen na een tweede lezing 10 s later.
-      await page.waitForTimeout(10_000)
-      rijen = await leesRitmonitor(page)
-      legeLijstBevestigd = rijen.length === 0
-      if (legeLijstBevestigd) console.log(`[${depot.naam}] Ritmonitor leeg (dubbel bevestigd) — resterende ritten worden afgerond`)
-    }
+    const rijen = await leesRitmonitor(page)
     console.log(`[${depot.naam}] Ritmonitor: ${rijen.length} ritten gelezen`)
-    await opslaanMonitorInSupabase(rijen, vandaag, depot.naam, legeLijstBevestigd)
+    await opslaanMonitorInSupabase(rijen, vandaag, depot.naam)
 
     if (depot.storageState) await context.storageState({ path: depot.storageState })
   } catch (error) {
