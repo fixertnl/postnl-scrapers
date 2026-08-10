@@ -60,6 +60,22 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null
 }
 
+// Zet een "HH:MM"-wandkloktijd (NL-tijdzone, op de gegeven datum) om naar een
+// ISO-timestamp. De Ritmonitor-kolom "Tijdstip laatste actie" bevat alleen een
+// tijd; de datum is altijd de scrape-dag. Retourneert null bij onparseerbaar.
+function nlTijdstipNaarIso(datum, tekst) {
+  const m = String(tekst || '').match(/(\d{1,2}):(\d{2})/)
+  if (!m) return null
+  const alsUtc = new Date(`${datum}T${m[1].padStart(2, '0')}:${m[2]}:00Z`)
+  if (Number.isNaN(alsUtc.getTime())) return null
+  // UTC-offset van de NL-tijdzone rond dat moment (bijv. "GMT+02:00").
+  const offsetNaam = new Intl.DateTimeFormat('en', { timeZone: CONFIG.timezone, timeZoneName: 'longOffset' })
+    .formatToParts(alsUtc).find(p => p.type === 'timeZoneName')?.value || ''
+  const om = offsetNaam.match(/([+-])(\d{2}):(\d{2})/)
+  const offsetMin = om ? (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3])) : 0
+  return new Date(alsUtc.getTime() - offsetMin * 60000).toISOString()
+}
+
 async function loginPostnl(page, depot) {
   console.log(`[${depot.naam}] Login pagina URL:`, page.url())
   await page.locator('input[type="text"], input[type="email"]').first().waitFor({ timeout: 15000 })
@@ -221,7 +237,7 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
 
   const { data: bestaande } = await supabase
     .from('ritten')
-    .select('id, ritnummer, status, postnl_stops_totaal, postnl_stops_te_doen, postnl_start_werktijd, postnl_eind_werktijd, postnl_monitor_opgehaald')
+    .select('id, ritnummer, status, postnl_stops_totaal, postnl_stops_te_doen, postnl_start_werktijd, postnl_eind_werktijd, postnl_monitor_opgehaald, postnl_laatste_actie')
     .eq('datum', datum).eq('depot', depotNaam)
 
   // Eerste rij per genormaliseerd ritnummer (dedup zoals de hoofd-sync).
@@ -348,9 +364,19 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       const opgehaald = r.postnl_monitor_opgehaald ? new Date(r.postnl_monitor_opgehaald).getTime() : 0
       if ((Date.now() - opgehaald) / 60000 < AFWEZIG_DREMPEL_MIN) continue
 
+      // Eindtijd: NIET het detectiemoment (dat ligt ≥20 min ná het echte einde),
+      // maar PostNL's eigen "Tijdstip laatste actie" — de laatste bezorghandeling
+      // van de chauffeur. Alleen als die ontbreekt of onplausibel is (in de
+      // toekomst, of vóór de starttijd) valt hij terug op de laatst-gezien-tijd.
+      const laatsteActieIso = nlTijdstipNaarIso(datum, r.postnl_laatste_actie)
+      const actieMs = laatsteActieIso ? new Date(laatsteActieIso).getTime() : null
+      const startMs = r.postnl_start_werktijd ? new Date(r.postnl_start_werktijd).getTime() : null
+      const actiePlausibel = actieMs !== null && actieMs <= Date.now() && (startMs === null || actieMs >= startMs)
+      const eindtijd = actiePlausibel ? laatsteActieIso : (r.postnl_monitor_opgehaald || nu)
+
       teUpdaten.push({ id: r.id, velden: {
         status: 'gereden',
-        postnl_eind_werktijd: nu,
+        postnl_eind_werktijd: eindtijd,
         postnl_monitor_opgehaald: nu,
       } })
       logRijen.push({
@@ -358,7 +384,7 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
         ritnummer:     key,
         stops_totaal:  r.postnl_stops_totaal,
         stops_te_doen: r.postnl_stops_te_doen,
-        laatste_actie: null,
+        laatste_actie: r.postnl_laatste_actie ?? null,
         actie:         'verdwenen-afgerond',
       })
     }
