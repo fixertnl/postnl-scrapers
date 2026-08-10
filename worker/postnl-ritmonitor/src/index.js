@@ -221,7 +221,7 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
 
   const { data: bestaande } = await supabase
     .from('ritten')
-    .select('id, ritnummer, postnl_stops_totaal, postnl_stops_te_doen, postnl_start_werktijd, postnl_eind_werktijd')
+    .select('id, ritnummer, status, postnl_stops_totaal, postnl_stops_te_doen, postnl_start_werktijd, postnl_eind_werktijd, postnl_monitor_opgehaald')
     .eq('datum', datum).eq('depot', depotNaam)
 
   // Eerste rij per genormaliseerd ritnummer (dedup zoals de hoofd-sync).
@@ -318,11 +318,51 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     }
   }
 
-  // Een rit wordt UITSLUITEND afgerond als we z'n "te doen = 0" daadwerkelijk
-  // (dubbel bevestigd) hebben gelezen — zie stopsTeDoenBevestigdNul hierboven.
-  // De oude "verdwenen uit grid → gereden"-detectie is bewust verwijderd: bij een
-  // gedeeltelijk geladen Mendix-grid verdwenen nog-bezige ritten uit de lijst en
-  // werden ze onterecht als klaar gemarkeerd (chauffeur nog onderweg).
+  // ── Verdwenen-uit-grid → afronden (veilig, met dubbele-miss-bevestiging) ──
+  // PostNL haalt een rit uit de Ritmonitor-grid zodra de chauffeur klaar is.
+  // Zo'n rit bereikt "te doen = 0" vaak nooit (onbezorgbare stops blijven staan),
+  // dus de nul-detectie hierboven pakt 'm niet — zonder deze pass blijft hij eeuwig
+  // op zijn laatste "te doen"-waarde hangen en toont "bezig · N te gaan" terwijl de
+  // chauffeur allang klaar is (de bug bij o.a. rit 640).
+  //
+  // Waarom de oude simpele "verdwenen → gereden" ooit is verwijderd: een half-geladen
+  // Mendix-grid liet bezige ritten eenmalig verdwijnen → die werden dan vals afgerond.
+  // Daarom eisen we nu dat de rit al MEERDERE polls niet meer gezien is, af te leiden
+  // uit de ouderdom van postnl_monitor_opgehaald (die ververst elke keer dat we 'm
+  // lezen). Een transient half-geladen grid herstelt de volgende poll → timer reset.
+  const AFWEZIG_DREMPEL_MIN = 20   // ≈ 3 gemiste polls bij de 7-min-cron
+  const gelezenNummers = new Set(rijen.map(r => r.ritnummer))
+
+  // Alleen zinvol als deze scrape zelf rijen opleverde — een lege lijst is
+  // waarschijnlijk een mislukte/half-geladen grid; dan niets afronden.
+  if (rijen.length > 0) {
+    for (const [key, r] of bestaandeMap) {
+      if (gelezenNummers.has(key)) continue                    // nog in de grid
+      if (r.status === 'gereden') continue                     // al afgerond
+      if (!r.postnl_start_werktijd) continue                   // nooit begonnen
+      if (r.postnl_eind_werktijd) continue                     // al eindtijd
+      if (r.postnl_stops_totaal == null) continue
+      // Was hij echt onderweg? (voortgang gemaakt, niet nog volledig "te doen")
+      if (!(r.postnl_stops_te_doen != null && r.postnl_stops_te_doen < r.postnl_stops_totaal)) continue
+      // Dubbele-miss-bevestiging via ouderdom van de laatste meting.
+      const opgehaald = r.postnl_monitor_opgehaald ? new Date(r.postnl_monitor_opgehaald).getTime() : 0
+      if ((Date.now() - opgehaald) / 60000 < AFWEZIG_DREMPEL_MIN) continue
+
+      teUpdaten.push({ id: r.id, velden: {
+        status: 'gereden',
+        postnl_eind_werktijd: nu,
+        postnl_monitor_opgehaald: nu,
+      } })
+      logRijen.push({
+        ...runContext,
+        ritnummer:     key,
+        stops_totaal:  r.postnl_stops_totaal,
+        stops_te_doen: r.postnl_stops_te_doen,
+        laatste_actie: null,
+        actie:         'verdwenen-afgerond',
+      })
+    }
+  }
 
   console.log(`[${depotNaam}] Ritmonitor-run: ${rijen.length} gelezen, ${bestaande?.length ?? 0} bestaand`)
 
