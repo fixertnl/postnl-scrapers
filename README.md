@@ -40,14 +40,16 @@ Handmatig testen kan via **Actions → (workflow kiezen) → Run workflow**, of
 ## Structuur
 
 ```
-worker/postnl-sync/              Dagplanning-scraper (ritten + stops)
+worker/postnl-dagplanning/       Dagplanning-scraper (ritten + stops) — map heet
+                                  postnl-dagplanning, workflow-bestand blijft
+                                  postnl-sync.yml (zie die file voor waarom)
 worker/postnl-ritmonitor/        Live voortgang per rit
   POSTNL_RITMONITOR.md           Volledige technische documentatie (lees dit eerst)
 worker/credentials-shared/       Ontsleutelt klant_credentials (crypto)
-worker/postnl-shared/            Optionele proxy-helper (hier niet nodig — elke
-                                  Actions-run heeft al een eigen IP)
 .github/workflows/                De twee Actions-workflows
 ```
+
+Elke worker bouwt zijn eigen (optionele) proxy-ondersteuning in — was ooit een gedeeld `worker/postnl-shared/`-bestandje, maar dat werd door precies twee bestanden gebruikt en voegde meer verwarring toe dan het scheelde. Zie de `metProxy()`-functie bovenin elke `src/index.js`.
 
 ## Relatie met `fixertnl/matransport`
 

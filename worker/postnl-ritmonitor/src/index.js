@@ -18,7 +18,27 @@ import http from 'node:http'
 import { chromium } from 'playwright'
 import { createClient } from '@supabase/supabase-js'
 import { getDepots } from '../../credentials-shared/src/index.js'
-import { metProxy } from '../../postnl-shared/proxy.js'
+
+// Optionele proxy — PostNL's Akamai-beveiliging blokkeert het IP van de
+// scrape-omgeving bij te veel geautomatiseerd verkeer vanaf één vast adres.
+// Hier grotendeels overbodig (elke GitHub Actions-run heeft al een ander IP
+// uit de pool), maar blijft bewust beschikbaar als extra beveiligingslaag.
+// Zet in GitHub Secrets (leeg = direct verbinden, ongewijzigd gedrag):
+//   PROXY_SERVER=http://gateway.provider.com:7000
+//   PROXY_USERNAME / PROXY_PASSWORD (optioneel)
+// Was worker/postnl-shared/proxy.js (gedeeld met postnl-dagplanning) — nu per
+// worker ingebouwd, want een map voor 15 regels code die door precies twee
+// bestanden gebruikt wordt voegde meer verwarring toe dan het oploste.
+function metProxy(launchOptions, label = '') {
+  const server = process.env.PROXY_SERVER
+  if (!server) return launchOptions
+  const proxy = { server }
+  if (process.env.PROXY_USERNAME) proxy.username = process.env.PROXY_USERNAME
+  if (process.env.PROXY_PASSWORD) proxy.password = process.env.PROXY_PASSWORD
+  launchOptions.proxy = proxy
+  console.log(`${label ? `[${label}] ` : ''}Proxy actief: ${proxy.server}`)
+  return launchOptions
+}
 
 const CONFIG = {
   timezone: process.env.TZ || 'Europe/Amsterdam',

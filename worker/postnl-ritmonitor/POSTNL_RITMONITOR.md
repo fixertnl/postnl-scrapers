@@ -72,7 +72,7 @@ Per klant in Supabase-tabel `klant_credentials` (versleuteld), opgehaald via `wo
 
 ## Scrape-mechaniek (breekbaar — Mendix-portaal)
 
-Grotendeels identiek aan de boilerplate in `worker/postnl-sync/` (bewust — zie header-comment in `src/index.js`):
+Grotendeels identiek aan de boilerplate in `worker/postnl-dagplanning/` (bewust — zie header-comment in `src/index.js`):
 
 - **`serviceWorkers: 'block'`** in de Playwright-context — de Mendix service-worker veroorzaakt anders herlaad-/chrome-error-loops vlak na de OAuth-redirect.
 - **"Tijdstip laatste actie" wisselt van tijdzone — UTC of NL-lokaal, niet voorspelbaar welke** (ontdekt 2026-08-24, tweede keer geraakt 2026-08-25, ondanks dat elke run hier een vers container-filesystem krijgt — dus **geen** sessie-hergebruik als verklaring, in tegenstelling tot wat op de vroegere VPS werd vermoed). Op 24 aug consistent UTC (gemeten door een live scrape naast een live screenshot te leggen: alle vergeleken ritten precies 2:00 verschil). Minder dan 24 uur later, zonder enige codewijziging, bleek de tekst NL-lokaal — een rit kreeg daardoor een `postnl_eind_werktijd` die **in de toekomst** lag (rit 905, 25 aug: "21:47"-tekst → opgeslagen als 21:47 UTC = 23:47 NL, terwijl het scrape-moment zelf pas 22:16 NL was).
