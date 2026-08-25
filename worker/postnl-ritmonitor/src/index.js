@@ -15,6 +15,9 @@
 import 'dotenv/config'
 import cron from 'node-cron'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import fs from 'node:fs/promises'
 import { chromium } from 'playwright'
 import { createClient } from '@supabase/supabase-js'
 import { getDepots } from '../../credentials-shared/src/index.js'
@@ -147,9 +150,15 @@ async function openDepotSessie(depot) {
   // (via nlTijdstipNaarIso, die de tekst juist als NL-lokaal interpreteert).
   const contextOptions = { serviceWorkers: 'block', timezoneId: CONFIG.timezone }
   try {
-    const fs = await import('node:fs')
-    if (depot.storageState && fs.existsSync(depot.storageState)) contextOptions.storageState = depot.storageState
+    const fsSync = await import('node:fs')
+    if (depot.storageState && fsSync.existsSync(depot.storageState)) contextOptions.storageState = depot.storageState
   } catch {}
+
+  // Video-opname van de sessie — op verzoek, zodat je kan meekijken in de
+  // browser zonder zelf POSTNL_HEADLESS=false te hoeven draaien. Bewaard via
+  // bewaarSessieVideo() na afloop (overwrite-latest per depot, zie migration_v156).
+  const videoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sessie-video-'))
+  contextOptions.recordVideo = { dir: videoDir, size: { width: 1280, height: 720 } }
 
   const context = await browser.newContext(contextOptions)
   const page = await context.newPage()
@@ -482,11 +491,40 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
   console.log(`[${depotNaam}] Ritmonitor ${datum}: bijgewerkt ${teUpdaten.length}, nieuw ${teInserten.length}`)
 }
 
+// Slaat de zojuist opgenomen sessie-video op in de private bucket
+// worker-sessies (migration_v156) — overwrite-latest per depot (vast pad,
+// geen timestamp), zodat opslag begrensd blijft tot één video per depot i.p.v.
+// een onbeperkt groeiend archief. Geeft het storage-pad terug, of null als er
+// geen video was of het opslaan mislukte (nooit de sync zelf laten falen op
+// een video-probleem).
+async function bewaarSessieVideo(video, depotNaam) {
+  if (!video) return null
+  let localPath
+  try {
+    localPath = await video.path()
+    const buffer = await fs.readFile(localPath)
+    const slug = depotNaam.toLowerCase().replace(/\s+/g, '-')
+    const storagePath = `${KLANT_ID}/postnl-ritmonitor/${slug}-latest.webm`
+    const { error } = await supabase.storage.from('worker-sessies')
+      .upload(storagePath, buffer, { contentType: 'video/webm', upsert: true })
+    if (error) throw error
+    console.log(`[${depotNaam}] Sessie-video opgeslagen: ${storagePath}`)
+    return storagePath
+  } catch (error) {
+    console.error(`[${depotNaam}] Video-opslag mislukt (sync gaat gewoon door):`, error.message)
+    return null
+  } finally {
+    if (localPath) await fs.unlink(localPath).catch(() => {})
+  }
+}
+
 async function syncMonitorDepot(depot) {
   const vandaag = vandaagNl()
   console.log(`[${depot.naam}] Ritmonitor sync voor ${vandaag}`)
 
   const { browser, context, page } = await openDepotSessie(depot)
+  let rijenAantal = 0
+  let fout = null
   try {
     await page.waitForTimeout(1000)
     await openRitmonitor(page, depot)
@@ -495,13 +533,21 @@ async function syncMonitorDepot(depot) {
     await opslaanMonitorInSupabase(rijen, vandaag, depot.naam)
 
     if (depot.storageState) await context.storageState({ path: depot.storageState })
-    return rijen.length
+    rijenAantal = rijen.length
   } catch (error) {
     console.error(`[${depot.naam}] Ritmonitor sync mislukt:`, error)
-    throw error
-  } finally {
-    await browser.close()
+    fout = error
   }
+
+  // Video pas na context.close() ophalen — Playwright rondt het bestand pas
+  // dan af, ervoor kan het nog onvolledig op schijf staan.
+  const video = page.video()
+  await context.close().catch(() => {})
+  await browser.close().catch(() => {})
+  const videoPath = await bewaarSessieVideo(video, depot.naam)
+
+  if (fout) { fout.videoPath = videoPath; throw fout }
+  return { rijen: rijenAantal, videoPath }
 }
 
 // Gestructureerd run-niveau-logboek in `worker_run_log` (migration_v150) —
@@ -552,11 +598,15 @@ async function syncRitmonitor() {
   // dataverlies-situatie zoals bij een gebufferde stdout-stream).
   const mislukt = []
   let rijenTotaal = 0
+  const videoPaths = []
   for (const depot of DEPOTS) {
     try {
-      rijenTotaal += await syncMonitorDepot(depot)
+      const { rijen, videoPath } = await syncMonitorDepot(depot)
+      rijenTotaal += rijen
+      if (videoPath) videoPaths.push({ depot: depot.naam, storage_path: videoPath })
     } catch (error) {
       mislukt.push({ depot: depot.naam, fout: error.message })
+      if (error.videoPath) videoPaths.push({ depot: depot.naam, storage_path: error.videoPath })
       console.error(`[${depot.naam}] Ritmonitor overgeslagen na fout (volgende depot gaat door):`, error.message)
     }
   }
@@ -565,6 +615,7 @@ async function syncRitmonitor() {
     await eindeRunLog(runLogId, {
       status: 'mislukt', depots_ok: 0, depots_mislukt: mislukt, rijen_gelezen: rijenTotaal,
       foutmelding: `Alle depots faalden: ${mislukt.map(m => `${m.depot} (${m.fout})`).join('; ')}`,
+      video_paths: videoPaths.length ? videoPaths : null,
     })
     throw new Error(`Ritmonitor: alle depots faalden (${mislukt.map(m => m.depot).join(', ')})`)
   }
@@ -576,6 +627,7 @@ async function syncRitmonitor() {
     depots_ok: depotsOk,
     depots_mislukt: mislukt.length ? mislukt : null,
     rijen_gelezen: rijenTotaal,
+    video_paths: videoPaths.length ? videoPaths : null,
   })
   if (mislukt.length) {
     console.warn(`Ritmonitor: gedeeltelijk gesynchroniseerd — overgeslagen: ${mislukt.map(m => m.depot).join(', ')}`)

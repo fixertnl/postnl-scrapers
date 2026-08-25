@@ -106,3 +106,13 @@ Náást `--once` (wat GitHub Actions gebruikt) heeft `src/index.js` ook een daem
 - Beide functies zijn **best-effort** (eigen try/catch) — een logging-probleem mag de eigenlijke sync nooit blokkeren.
 
 **Staleness-alert**: `public.check_worker_staleness()` (pg_cron in matransport's Supabase-project, elke 15 min, 06:15–22:55 NL-tijd) checkt of de laatste succesvolle run niet ouder is dan 20 minuten en pusht zo nodig naar de admins. Werkt automatisch voor deze GitHub-Actions-runs, want ze schrijven naar dezelfde database met dezelfde `worker_naam` — geen aparte configuratie nodig.
+
+## Sessie-video (`worker-sessies` bucket)
+
+Elke depot-sessie neemt een Playwright-video op (`recordVideo` op de browser-context, 1280×720) — zodat je kan meekijken in de browser zonder zelf `POSTNL_HEADLESS=false` te hoeven draaien. Alleen voor deze worker gebouwd (niet voor `postnl-dagplanning`).
+
+- **`bewaarSessieVideo(video, depotNaam)`** draait na `context.close()`/`browser.close()` (Playwright rondt het video-bestand pas dán af — ervoor ophalen geeft een onvolledig bestand) en uploadt naar de private Supabase Storage-bucket `worker-sessies` (matransport migration_v156).
+- **Pad-conventie: overwrite-latest**, geen timestamp: `{klant_id}/postnl-ritmonitor/{depot-slug}-latest.webm`. Elke run overschrijft de vorige video van dat depot — bewuste keuze om opslag te begrenzen tot één video per depot i.p.v. een onbeperkt groeiend archief (geen aparte opschoon-cron nodig). Je ziet dus altijd alleen de laatste sessie, niet de geschiedenis.
+- **Best-effort, net als de run-log**: een mislukte video-upload (bv. netwerkfout) logt een warning en laat de sync gewoon doorgaan — nooit de sync zelf laten falen op een video-probleem.
+- `syncMonitorDepot()` geeft nu `{ rijen, videoPath }` terug (bij een fout: gooit alsnog, maar met `.videoPath` op het error-object, zodat een video van een mislukte poging ook bewaard blijft). `syncRitmonitor()` verzamelt deze in `videoPaths` en schrijft ze als `video_paths` (jsonb-array van `{depot, storage_path}`) naar `worker_run_log` — zowel bij succes/gedeeltelijk succes als bij "alle depots faalden".
+- **Bekijken**: signed URL ophalen via `storageUrls.js`-patroon (RLS: alleen admins, klant-gescoped via `(storage.foldername(name))[1] = my_klant_id()::text`) — er is nog geen UI-knop voor gebouwd, dit is puur de opslagkant. Handmatig ophalen kan via `supabase.storage.from('worker-sessies').createSignedUrl(path, ...)`.
