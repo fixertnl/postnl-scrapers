@@ -60,20 +60,40 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null
 }
 
-// Zet een "HH:MM"-wandkloktijd (NL-tijdzone, op de gegeven datum) om naar een
-// ISO-timestamp. De Ritmonitor-kolom "Tijdstip laatste actie" bevat alleen een
-// tijd; de datum is altijd de scrape-dag. Retourneert null bij onparseerbaar.
-function nlTijdstipNaarIso(datum, tekst) {
+// Zet een "HH:MM"-wandkloktijd uit de Ritmonitor-kolom "Tijdstip laatste actie"
+// om naar een ISO-timestamp. De datum is altijd de scrape-dag. Retourneert
+// null bij onparseerbaar of als geen van beide interpretaties plausibel is.
+//
+// LET OP — de tijdzone waarin deze tekst gerenderd wordt, wisselt: soms UTC,
+// soms NL-lokaal (CEST). Op 2026-08-24 was 't consistent UTC (gemeten door een
+// live scrape naast een live screenshot te leggen); nog geen 24u later, op
+// 2026-08-25, bleek 't zonder enige codewijziging omgeslagen naar NL-lokaal —
+// vermoedelijk hangt Mendix de tijdzone bij het inloggen aan de sessie, en
+// verandert dat zodra de hergebruikte `storageState`-sessie (zie
+// openDepotSessie) een keer opnieuw moet inloggen. Hardcoded op één
+// interpretatie gokken bleek dus niet houdbaar: dit rekent daarom BEIDE
+// interpretaties uit en kiest de plausibele — een "laatste actie" kan nooit
+// ná het scrape-moment (nuMs) liggen, dus die kandidaat valt af. Blijven er
+// twee over (bv. bij een echte UTC-tekst is "als-NL-lokaal" toevallig ook
+// niet in de toekomst, want 2 uur eerder), dan wint de meest recente — de
+// juiste interpretatie ligt vrijwel altijd dichter bij het scrape-moment dan
+// de foute (die 2 uur verder terug zou liggen).
+function nlTijdstipNaarIso(datum, tekst, nuMs = Date.now()) {
   const m = String(tekst || '').match(/(\d{1,2}):(\d{2})/)
   if (!m) return null
   const alsUtc = new Date(`${datum}T${m[1].padStart(2, '0')}:${m[2]}:00Z`)
   if (Number.isNaN(alsUtc.getTime())) return null
-  // UTC-offset van de NL-tijdzone rond dat moment (bijv. "GMT+02:00").
+
   const offsetNaam = new Intl.DateTimeFormat('en', { timeZone: CONFIG.timezone, timeZoneName: 'longOffset' })
     .formatToParts(alsUtc).find(p => p.type === 'timeZoneName')?.value || ''
   const om = offsetNaam.match(/([+-])(\d{2}):(\d{2})/)
   const offsetMin = om ? (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3])) : 0
-  return new Date(alsUtc.getTime() - offsetMin * 60000).toISOString()
+  const alsNlLokaal = new Date(alsUtc.getTime() - offsetMin * 60000)
+
+  const kandidaten = [alsUtc, alsNlLokaal]
+    .filter(d => d.getTime() <= nuMs)
+    .sort((a, b) => b.getTime() - a.getTime())
+  return kandidaten[0]?.toISOString() ?? null
 }
 
 async function loginPostnl(page, depot) {
@@ -100,7 +120,12 @@ async function openDepotSessie(depot) {
 
   // serviceWorkers blokkeren: de Mendix service-worker veroorzaakt anders
   // herlaad-/chrome-error-loops vlak na de OAuth-redirect.
-  const contextOptions = { serviceWorkers: 'block' }
+  // timezoneId expliciet zetten: zonder dit rendert Mendix "Tijdstip laatste
+  // actie" client-side in de systeem-tijdzone van de scrape-browser i.p.v.
+  // NL-lokale tijd — gaf een structureel 2 uur (CEST) verschil met wat een
+  // mens op de site ziet, en dat plantte zich door in postnl_eind_werktijd
+  // (via nlTijdstipNaarIso, die de tekst juist als NL-lokaal interpreteert).
+  const contextOptions = { serviceWorkers: 'block', timezoneId: CONFIG.timezone }
   try {
     const fs = await import('node:fs')
     if (depot.storageState && fs.existsSync(depot.storageState)) contextOptions.storageState = depot.storageState
@@ -116,6 +141,24 @@ async function openDepotSessie(depot) {
   return { browser, context, page }
 }
 
+// Koppelt chauffeur_id aan postnl_chauffeur — en corrigeert 'm ook als 'ie al
+// gezet was (geen .is('chauffeur_id', null) meer, sinds 2026-08-24). Een rit
+// mag nooit een andere chauffeur_id hebben dan wie PostNL's eigen data zegt
+// dat er reed — dat veld bepaalt wie voor de stops betaald krijgt. Zonder
+// deze correctie bleef een rit voor altijd aan de eerst-gekoppelde chauffeur
+// hangen, ook als er in werkelijkheid een chauffeurwissel was (bv. rit 333 op
+// 12 aug 2026: chauffeur_id wees naar Mulubrhan Haile terwijl postnl_chauffeur
+// al lang "Saboune, Y." zei — nooit gecorrigeerd doordat de oude .is(null)
+// -guard elke volgende sync blokkeerde).
+//
+// Dit botst niet met de oorspronkelijke reden voor die guard (issue #71: een
+// handmatige herindeling via RitForm/RitDetail mag niet worden teruggedraaid)
+// — .eq('postnl_chauffeur', u.postnl_naam) matcht sowieso nooit een rit met
+// postnl_chauffeur = null, en dat is precies het geval bij @Home/freelance-
+// ritten (geen PostNL-account, dus nooit een postnl_chauffeur-waarde) waar
+// handmatige chauffeur-wissel voor bedoeld is. Regulier gescrapete ritten
+// hébben altijd een postnl_chauffeur-waarde zodra ze in de Ritmonitor-grid
+// verschijnen, en daar is die waarde leidend.
 async function koppelChauffeurs() {
   const klantId = KLANT_ID
   const { data: users } = await supabase
@@ -125,15 +168,21 @@ async function koppelChauffeurs() {
   if (!users?.length) return
   let totaal = 0
   for (const u of users) {
+    // .or(...) matcht alleen rijen die écht een andere chauffeur_id nodig
+    // hebben (null, of een andere waarde) — puur om onnodige writes en een
+    // opgeblazen "X bijgewerkt"-log te vermijden. Niet nodig voor correctheid:
+    // de DB-trigger trg_notify_rit_toegewezen (migration_v139) no-opt zelf al
+    // bij een ongewijzigde waarde, dus een overbodige write zou sowieso geen
+    // dubbele pushmelding veroorzaken.
     const { data } = await supabase.from('ritten')
       .update({ chauffeur_id: u.id })
       .eq('klant_id', klantId)
       .eq('postnl_chauffeur', u.postnl_naam)
-      .is('chauffeur_id', null)
+      .or(`chauffeur_id.is.null,chauffeur_id.neq.${u.id}`)
       .select('id')
     totaal += data?.length ?? 0
   }
-  if (totaal > 0) console.log(`Chauffeurs gekoppeld: ${totaal} ritten bijgewerkt`)
+  if (totaal > 0) console.log(`Chauffeurs gekoppeld/gecorrigeerd: ${totaal} ritten bijgewerkt`)
 }
 
 // ---- Ritmonitor-specifiek ---------------------------------------
@@ -292,21 +341,30 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       velden.postnl_start_werktijd = nu
     }
 
-    // Eindtijd: zodra stops_te_doen bevestigd 0 is — niet wachten tot de rit verdwijnt.
-    if (
-      stopsTeDoenBevestigdNul &&
-      rit.stopsTotaal !== null &&
-      rit.stopsTotaal > 0 &&
-      existing?.postnl_start_werktijd &&
-      !existing?.postnl_eind_werktijd
-    ) {
-      velden.postnl_eind_werktijd = nu
+    // Eindtijd: continu bijgewerkt naar de laatst gelezen "tijdstip laatste actie",
+    // zolang de rit nog niet definitief 'gereden' is (niet pas ná bevestiging via
+    // bevestigd-nul of verdwenen-uit-grid hieronder). Reden: als de polling zelf
+    // ooit stopt — VPS-crash, dispatch-storing, per-depot-uitval, zie git-historie
+    // 2026-08-24 — vóórdat een van die twee paden kan vuren, bleef eind_werktijd
+    // voorheen voor altijd null, terwijl we allang een laatst bekende actie-tijd
+    // hadden. Nu blijft in elk geval de laatste gelezen waarde staan.
+    //
+    // BELANGRIJK: dit is dus niet per se een bevestigde eindtijd — pas zodra
+    // status === 'gereden' is die bevestigd (via bevestigd-nul of verdwenen-uit-
+    // grid). Zolang status 'bezig' blijft, is dit een voorlopige waarde (chauffeur
+    // kan nog bezig zijn — dit is dan gewoon zijn laatst bekende actie, geen
+    // afgeronde dienst). Front-end moet dat onderscheid tonen (bv. een "!" achter
+    // de tijd) zolang status niet 'gereden' is — zie RITTEN_ARCHITECTUUR.md.
+    if (existing?.postnl_start_werktijd && existing?.status !== 'gereden') {
+      const actieIso = nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime())
+      if (actieIso) velden.postnl_eind_werktijd = actieIso
     }
 
     // Diagnostisch loggen: wat las de worker + welke beslissing nam hij voor deze rit.
     const actie = !existing ? 'nieuw'
-      : velden.postnl_eind_werktijd ? 'eind-nul'
+      : stopsTeDoenBevestigdNul ? 'eind-nul'
       : velden.postnl_start_werktijd ? 'start-gezet'
+      : velden.postnl_eind_werktijd ? 'eind-bijgewerkt'
       : 'gelezen'
     logRijen.push({
       ...runContext,
@@ -354,9 +412,11 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
   if (rijen.length > 0) {
     for (const [key, r] of bestaandeMap) {
       if (gelezenNummers.has(key)) continue                    // nog in de grid
+      // 'gereden' is de enige "al afgerond"-check — postnl_eind_werktijd staat
+      // inmiddels vrijwel altijd al gevuld (continue update hierboven, zie
+      // 2026-08-24), dus die kan niet meer als "al klaar"-signaal dienen.
       if (r.status === 'gereden') continue                     // al afgerond
       if (!r.postnl_start_werktijd) continue                   // nooit begonnen
-      if (r.postnl_eind_werktijd) continue                     // al eindtijd
       if (r.postnl_stops_totaal == null) continue
       // Was hij echt onderweg? (voortgang gemaakt, niet nog volledig "te doen")
       if (!(r.postnl_stops_te_doen != null && r.postnl_stops_te_doen < r.postnl_stops_totaal)) continue
@@ -366,12 +426,13 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
 
       // Eindtijd: NIET het detectiemoment (dat ligt ≥20 min ná het echte einde),
       // maar PostNL's eigen "Tijdstip laatste actie" — de laatste bezorghandeling
-      // van de chauffeur. Alleen als die ontbreekt of onplausibel is (in de
-      // toekomst, of vóór de starttijd) valt hij terug op de laatst-gezien-tijd.
-      const laatsteActieIso = nlTijdstipNaarIso(datum, r.postnl_laatste_actie)
+      // van de chauffeur. "Niet in de toekomst" wordt al binnen nlTijdstipNaarIso()
+      // zelf afgedwongen; hier blijft alleen de "niet vóór de starttijd"-check over
+      // (die kent de functie zelf niet). Onplausibel → terugval op laatst-gezien-tijd.
+      const laatsteActieIso = nlTijdstipNaarIso(datum, r.postnl_laatste_actie, new Date(nu).getTime())
       const actieMs = laatsteActieIso ? new Date(laatsteActieIso).getTime() : null
       const startMs = r.postnl_start_werktijd ? new Date(r.postnl_start_werktijd).getTime() : null
-      const actiePlausibel = actieMs !== null && actieMs <= Date.now() && (startMs === null || actieMs >= startMs)
+      const actiePlausibel = actieMs !== null && (startMs === null || actieMs >= startMs)
       const eindtijd = actiePlausibel ? laatsteActieIso : (r.postnl_monitor_opgehaald || nu)
 
       teUpdaten.push({ id: r.id, velden: {
@@ -414,6 +475,7 @@ async function syncMonitorDepot(depot) {
     await opslaanMonitorInSupabase(rijen, vandaag, depot.naam)
 
     if (depot.storageState) await context.storageState({ path: depot.storageState })
+    return rijen.length
   } catch (error) {
     console.error(`[${depot.naam}] Ritmonitor sync mislukt:`, error)
     throw error
@@ -422,30 +484,81 @@ async function syncMonitorDepot(depot) {
   }
 }
 
+// Gestructureerd run-niveau-logboek in `worker_run_log` (migration_v150) —
+// ontstaan uit een troubleshoot-sessie waarin de PM2-console-logs structureel
+// geen ritmonitor-activiteit bleken te tonen (onverklaard, los probleem) en er
+// geen enkel run-niveau-overzicht bestond ("draait dit eigenlijk nog?"). Eén
+// rij per run: INSERT bij start, UPDATE bij einde. Een gecrashte run die nooit
+// de UPDATE haalt blijft zichtbaar als "gestart maar nooit afgerond" — net zo'n
+// signaal als een expliciete fout. Best-effort: een logging-fout mag de
+// eigenlijke sync nooit blokkeren.
+async function startRunLog() {
+  try {
+    const { data } = await supabase.from('worker_run_log')
+      .insert({ worker_naam: 'postnl-ritmonitor', klant_id: KLANT_ID })
+      .select('id').single()
+    return data?.id ?? null
+  } catch (error) {
+    console.error('startRunLog mislukt (sync gaat gewoon door):', error.message)
+    return null
+  }
+}
+
+async function eindeRunLog(runLogId, velden) {
+  if (!runLogId) return
+  try {
+    await supabase.from('worker_run_log').update({ afgerond_at: new Date().toISOString(), ...velden }).eq('id', runLogId)
+  } catch (error) {
+    console.error('eindeRunLog mislukt:', error.message)
+  }
+}
+
 async function syncRitmonitor() {
+  const runLogId = await startRunLog()
   const DEPOTS = await getDepots(supabase, KLANT_ID, 'postnl')
-  if (DEPOTS.length === 0) throw new Error('Geen depots geconfigureerd (klant_credentials leeg voor deze klant)')
+  if (DEPOTS.length === 0) {
+    await eindeRunLog(runLogId, { status: 'mislukt', foutmelding: 'Geen depots geconfigureerd' })
+    throw new Error('Geen depots geconfigureerd (klant_credentials leeg voor deze klant)')
+  }
 
   // Per-depot isoleren: een transiente time-out bij één depot (trage Mendix-
   // grid / sessie-redirect) mag de hele 10-min-run niet laten falen wanneer de
   // andere depots wél slagen. Alleen falen als ALLE depots faalden.
+  //
+  // De foutmelding gaat hier bewust ook naar worker_run_log (depot + error.message),
+  // niet alleen naar console.error — tijdens een instabiele periode (VPS-crash-loop,
+  // zie 12 aug 2026) kan de console-log wegvallen vóórdat 'ie geflushed is, terwijl
+  // een DB-write via een losse request altijd aankomt of hard faalt (geen stille
+  // dataverlies-situatie zoals bij een gebufferde stdout-stream).
   const mislukt = []
+  let rijenTotaal = 0
   for (const depot of DEPOTS) {
     try {
-      await syncMonitorDepot(depot)
+      rijenTotaal += await syncMonitorDepot(depot)
     } catch (error) {
-      mislukt.push(depot.naam)
+      mislukt.push({ depot: depot.naam, fout: error.message })
       console.error(`[${depot.naam}] Ritmonitor overgeslagen na fout (volgende depot gaat door):`, error.message)
     }
   }
 
   if (mislukt.length === DEPOTS.length) {
-    throw new Error(`Ritmonitor: alle depots faalden (${mislukt.join(', ')})`)
+    await eindeRunLog(runLogId, {
+      status: 'mislukt', depots_ok: 0, depots_mislukt: mislukt, rijen_gelezen: rijenTotaal,
+      foutmelding: `Alle depots faalden: ${mislukt.map(m => `${m.depot} (${m.fout})`).join('; ')}`,
+    })
+    throw new Error(`Ritmonitor: alle depots faalden (${mislukt.map(m => m.depot).join(', ')})`)
   }
 
   await koppelChauffeurs()
+  const depotsOk = DEPOTS.length - mislukt.length
+  await eindeRunLog(runLogId, {
+    status: mislukt.length ? 'deels_mislukt' : 'ok',
+    depots_ok: depotsOk,
+    depots_mislukt: mislukt.length ? mislukt : null,
+    rijen_gelezen: rijenTotaal,
+  })
   if (mislukt.length) {
-    console.warn(`Ritmonitor: gedeeltelijk gesynchroniseerd — overgeslagen: ${mislukt.join(', ')}`)
+    console.warn(`Ritmonitor: gedeeltelijk gesynchroniseerd — overgeslagen: ${mislukt.map(m => m.depot).join(', ')}`)
   } else {
     console.log('Ritmonitor: alle depots gesynchroniseerd')
   }

@@ -386,18 +386,29 @@ async function koppelChauffeurs() {
   if (!users?.length) return
   let totaal = 0
   for (const u of users) {
-    // .is('chauffeur_id', null) voorkomt dat een handmatige herindeling door
-    // de dispatcher (RitForm/RitDetail) bij de volgende sync weer wordt
-    // overschreven met de oorspronkelijke PostNL-koppeling — zie issue #71.
+    // Sinds 2026-08-24 geen .is('chauffeur_id', null) meer — een rit mag
+    // nooit een andere chauffeur_id hebben dan wie PostNL's eigen data zegt
+    // dat er reed (dat veld bepaalt wie voor de stops betaald krijgt). De
+    // oude guard (issue #71, bedoeld om handmatige RitForm/RitDetail-
+    // herindelingen te beschermen) liet een rit voor altijd aan de eerst-
+    // gekoppelde chauffeur hangen, ook ná een echte chauffeurwissel (bv. rit
+    // 333 op 12 aug 2026: chauffeur_id bleef op Mulubrhan Haile staan terwijl
+    // postnl_chauffeur allang "Saboune, Y." zei). Botst niet met issue #71:
+    // .eq('postnl_chauffeur', u.postnl_naam) matcht sowieso nooit een rit met
+    // postnl_chauffeur = null, en dat is precies het geval bij @Home/
+    // freelance-ritten (geen PostNL-account) waar handmatige chauffeur-
+    // wissel voor bedoeld is — die blijven dus onaangeroerd.
+    // .or(...) matcht alleen rijen die écht een andere chauffeur_id nodig
+    // hebben, puur om onnodige writes/een opgeblazen log te vermijden.
     const { data } = await supabase.from('ritten')
       .update({ chauffeur_id: u.id })
       .eq('klant_id', klantId)
       .eq('postnl_chauffeur', u.postnl_naam)
-      .is('chauffeur_id', null)
+      .or(`chauffeur_id.is.null,chauffeur_id.neq.${u.id}`)
       .select('id')
     totaal += data?.length ?? 0
   }
-  if (totaal > 0) console.log(`Chauffeurs gekoppeld: ${totaal} ritten bijgewerkt`)
+  if (totaal > 0) console.log(`Chauffeurs gekoppeld/gecorrigeerd: ${totaal} ritten bijgewerkt`)
 }
 
 async function syncPostnlStops(markeerGereden = false, allesDatums = false, syncDatum = null) {
