@@ -24,17 +24,38 @@ Instellen via **Settings → Secrets and variables → Actions → New repositor
 ## Triggeren
 
 De workflows draaien op `workflow_dispatch` — getriggerd door Supabase `pg_cron`
-via de GitHub API (zelfde patroon als vroeger, `github_dispatch_token` in Vault).
+(in het `fixertnl/matransport`-project) via de GitHub API, met Vault-secret
+`postnl_scrapers_token` (rechtstreeks vanuit `public.trigger_postnl_sync()` /
+`public.trigger_ritmonitor()` — geen tussenstap via een VPS meer).
 **Nooit `on: schedule`** gebruiken: dat vuurt minuten tot uren te laat.
 
-Handmatig testen kan via **Actions → (workflow kiezen) → Run workflow**.
+⚠️ Deze functies zijn ooit rechtstreeks in de Supabase-database aangepast, niet
+via een migratiebestand in `matransport` — check bij twijfel de live definitie
+(`select pg_get_functiondef(oid) from pg_proc where proname = 'trigger_ritmonitor'`)
+i.p.v. op matransport's migratiebestanden te vertrouwen.
+
+Handmatig testen kan via **Actions → (workflow kiezen) → Run workflow**, of
+`gh workflow run postnl-ritmonitor.yml` / `postnl-sync.yml`.
 
 ## Structuur
 
 ```
-worker/postnl-sync/         Dagplanning-scraper (ritten + stops)
-worker/postnl-ritmonitor/   Live voortgang per rit
-worker/credentials-shared/  Ontsleutelt klant_credentials (crypto)
-worker/postnl-shared/       Optionele proxy-helper (hier niet nodig)
-.github/workflows/          De twee Actions-workflows
+worker/postnl-sync/              Dagplanning-scraper (ritten + stops)
+worker/postnl-ritmonitor/        Live voortgang per rit
+  POSTNL_RITMONITOR.md           Volledige technische documentatie (lees dit eerst)
+worker/credentials-shared/       Ontsleutelt klant_credentials (crypto)
+worker/postnl-shared/            Optionele proxy-helper (hier niet nodig — elke
+                                  Actions-run heeft al een eigen IP)
+.github/workflows/                De twee Actions-workflows
 ```
+
+## Relatie met `fixertnl/matransport`
+
+Deze repo is de **enige** bron voor de PostNL-scrape-logica sinds 2026-08-25 —
+de hoofd-app-repo (`fixertnl/matransport`) had eerder eigen kopieën van beide
+workers (via een always-on VPS), maar die zijn verwijderd toen bleek dat de
+automatische triggers hier via GitHub Actions liepen, niet via die VPS. Een fix
+aan scrape-/parse-/tijdzone-/chauffeur-koppel-logica hoort dus **hier**, nooit
+in `matransport`. Zie `matransport`'s `CLAUDE.md` § PostNL integration voor het
+bredere app-datamodel (welke kolommen in `ritten` deze workers vullen, hoe de
+Ritten-pagina de live voortgang toont, enz.).
