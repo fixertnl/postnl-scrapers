@@ -272,6 +272,38 @@ async function openDagplanning(page, depotUrl, depot) {
   return (await datumSelect.count() > 0) ? datumSelect : null
 }
 
+// GitHub Actions zet deze env-vars automatisch — geeft een directe link naar
+// de Actions-log van deze run terug voor worker_run_log. null buiten Actions.
+function githubRunUrl() {
+  const { GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID } = process.env
+  if (!GITHUB_SERVER_URL || !GITHUB_REPOSITORY || !GITHUB_RUN_ID) return null
+  return `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}`
+}
+
+// Gestructureerd run-niveau-logboek in worker_run_log (migration_v150, uitgebreid
+// in migration_v158 met deze worker) — zelfde patroon als postnl-ritmonitor.
+// Best-effort: een logging-probleem mag de eigenlijke sync nooit blokkeren.
+async function startRunLog() {
+  try {
+    const { data } = await supabase.from('worker_run_log')
+      .insert({ worker_naam: 'postnl-dagplanning', klant_id: KLANT_ID, run_url: githubRunUrl() })
+      .select('id').single()
+    return data?.id ?? null
+  } catch (error) {
+    console.error('startRunLog mislukt (sync gaat gewoon door):', error.message)
+    return null
+  }
+}
+
+async function eindeRunLog(runLogId, velden) {
+  if (!runLogId) return
+  try {
+    await supabase.from('worker_run_log').update({ afgerond_at: new Date().toISOString(), ...velden }).eq('id', runLogId)
+  } catch (error) {
+    console.error('eindeRunLog mislukt:', error.message)
+  }
+}
+
 async function syncDepot(depot, markeerGereden = false, allesDatums = false, syncDatum = null) {
   const vandaag = vandaagNl()
   const logLabel = syncDatum ? `voor ${syncDatum}` : allesDatums ? '(alle datums)' : `voor ${vandaag}`
@@ -323,6 +355,7 @@ async function syncDepot(depot, markeerGereden = false, allesDatums = false, syn
       teSyncen = [{ datum: vandaag, label: `${dag}-${maand}-${jaar}` }]
     }
 
+    let totaalGesynced = 0
     for (const { datum, label: datumLabel } of teSyncen) {
       const datumSelect = await openDagplanning(page, depot.url, depot)
 
@@ -385,10 +418,12 @@ async function syncDepot(depot, markeerGereden = false, allesDatums = false, syn
         markeerGereden && !isVerleden,
         isVerleden ? 'gereden' : 'gepland'
       )
+      totaalGesynced += uniekRitten.length
     }
 
     if (depot.storageState) await context.storageState({ path: depot.storageState })
     console.log(`[${depot.naam}] Sync klaar`)
+    return totaalGesynced
   } catch (error) {
     console.error(`[${depot.naam}] Sync mislukt:`, error)
     throw error
@@ -435,11 +470,29 @@ async function syncPostnlStops(markeerGereden = false, allesDatums = false, sync
   const actieveDepots = await getDepots(supabase, KLANT_ID, 'postnl')
   if (actieveDepots.length === 0) throw new Error('Geen depots geconfigureerd (klant_credentials leeg voor deze klant)')
   console.log(`Start PostNL sync voor ${actieveDepots.map(d => d.naam).join(', ')}`)
+  const depotsOk = []
+  let ritenTotaal = 0
   for (const depot of actieveDepots) {
-    await syncDepot(depot, markeerGereden, allesDatums, syncDatum)
+    try {
+      const aantal = await syncDepot(depot, markeerGereden, allesDatums, syncDatum)
+      depotsOk.push(depot.naam)
+      ritenTotaal += aantal ?? 0
+    } catch (error) {
+      // Geen per-depot-isolatie (bewust anders dan postnl-ritmonitor) — één
+      // mislukte depot laat syncMetRetry de HELE poging opnieuw proberen,
+      // want dagplanning's dedup/insert-logica is niet idempotent-veilig
+      // genoeg om een halve batch achter te laten en later bij te werken.
+      // Wel context aan de error hangen zodat de run-log ziet hoe ver we kwamen.
+      error.depotsOk = depotsOk
+      error.depotsTotaal = actieveDepots.length
+      error.ritenTotaal = ritenTotaal
+      error.depotNaam = depot.naam
+      throw error
+    }
   }
   await koppelChauffeurs()
   console.log('Alle depots gesynchroniseerd')
+  return { depotsOk, ritenTotaal, depotsTotaal: actieveDepots.length }
 }
 
 const runOnce = process.argv.includes('--once') || process.env.RUN_ONCE === 'true'
@@ -447,9 +500,11 @@ const runAll  = process.argv.includes('--all')  || process.env.RUN_ALL  === 'tru
 const runDatum = process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a)) || process.env.SYNC_DATUM || null
 
 async function syncMetRetry(markeer, allesDatums = false, syncDatum = null, pogingen = 3) {
+  const runLogId = await startRunLog()
   for (let poging = 1; poging <= pogingen; poging++) {
     try {
-      await syncPostnlStops(markeer, allesDatums, syncDatum)
+      const { depotsOk, ritenTotaal } = await syncPostnlStops(markeer, allesDatums, syncDatum)
+      await eindeRunLog(runLogId, { status: 'ok', depots_ok: depotsOk.length, rijen_gelezen: ritenTotaal })
       return
     } catch (err) {
       console.error(`Poging ${poging}/${pogingen} mislukt:`, err.message)
@@ -458,6 +513,13 @@ async function syncMetRetry(markeer, allesDatums = false, syncDatum = null, pogi
         console.log(`Wacht ${wacht / 1000}s voor volgende poging...`)
         await new Promise(r => setTimeout(r, wacht))
       } else {
+        await eindeRunLog(runLogId, {
+          status: 'mislukt',
+          depots_ok: err.depotsOk?.length ?? 0,
+          depots_mislukt: err.depotNaam ? [{ depot: err.depotNaam, fout: err.message }] : null,
+          rijen_gelezen: err.ritenTotaal ?? null,
+          foutmelding: err.message,
+        })
         process.exit(1)
       }
     }
