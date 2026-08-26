@@ -101,7 +101,7 @@ Náást `--once` (wat GitHub Actions gebruikt) heeft `src/index.js` ook een daem
 ## Run-monitoring (`worker_run_log`)
 
 `syncRitmonitor()` schrijft naast de console.log-regels ook een gestructureerde rij naar de Supabase-tabel `public.worker_run_log` (matransport migration_v150, generiek per worker, `worker_naam`-kolom):
-- **INSERT bij start** (`startRunLog()`) — `status: 'gestart'`. Een gecrashte run die de UPDATE nooit haalt, blijft dus zichtbaar als "gestart maar nooit afgerond".
+- **INSERT bij start** (`startRunLog()`) — `status: 'gestart'`, plus `run_url` (matransport migration_v157): `githubRunUrl()` bouwt de directe link naar de Actions-run op uit GitHub's eigen `GITHUB_SERVER_URL`/`GITHUB_REPOSITORY`/`GITHUB_RUN_ID` env-vars (automatisch gezet, geen configuratie nodig) — `null` buiten GitHub Actions. Een gecrashte run die de UPDATE nooit haalt, blijft dus zichtbaar als "gestart maar nooit afgerond", én je kan direct doorklikken naar de logs zonder handmatig `gh run list` te doorzoeken.
 - **UPDATE bij einde** (`eindeRunLog()`) — `status: 'ok'/'deels_mislukt'/'mislukt'`, `depots_ok`, `depots_mislukt` (jsonb-array van `{depot, fout}`-objecten), `rijen_gelezen`.
 - Beide functies zijn **best-effort** (eigen try/catch) — een logging-probleem mag de eigenlijke sync nooit blokkeren.
 

@@ -558,10 +558,20 @@ async function syncMonitorDepot(depot) {
 // de UPDATE haalt blijft zichtbaar als "gestart maar nooit afgerond" — net zo'n
 // signaal als een expliciete fout. Best-effort: een logging-fout mag de
 // eigenlijke sync nooit blokkeren.
+// GitHub Actions zet deze env-vars automatisch (server-url/repo/run-id) — geeft
+// een directe link terug naar de Actions-log van deze run, zodat je bij een
+// mislukte run niet meer handmatig door `gh run list` hoeft te zoeken naar het
+// juiste tijdstip. null buiten GitHub Actions (bv. lokaal testen).
+function githubRunUrl() {
+  const { GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID } = process.env
+  if (!GITHUB_SERVER_URL || !GITHUB_REPOSITORY || !GITHUB_RUN_ID) return null
+  return `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}`
+}
+
 async function startRunLog() {
   try {
     const { data } = await supabase.from('worker_run_log')
-      .insert({ worker_naam: 'postnl-ritmonitor', klant_id: KLANT_ID })
+      .insert({ worker_naam: 'postnl-ritmonitor', klant_id: KLANT_ID, run_url: githubRunUrl() })
       .select('id').single()
     return data?.id ?? null
   } catch (error) {
