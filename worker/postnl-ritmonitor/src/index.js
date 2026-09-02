@@ -83,6 +83,23 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null
 }
 
+// Zet een "HH:MM"-tijd uit shift_tijden (NL-lokaal) om naar een UTC ISO-string.
+// Shift-tijden komen uit de e-mail (altijd NL-lokale wandkloktijd, niet van
+// PostNL's Mendix-grid) — dus hier geen heuristiek nodig: gewoon de offset
+// van Europe/Amsterdam op die datum aftrekken.
+function shiftTijdNaarIso(datum, tijd) {
+  if (!datum || !tijd) return null
+  const m = String(tijd).match(/(\d{1,2}):(\d{2})/)
+  if (!m) return null
+  const asUtc = new Date(`${datum}T${m[1].padStart(2, '0')}:${m[2]}:00Z`)
+  if (Number.isNaN(asUtc.getTime())) return null
+  const offsetNaam = new Intl.DateTimeFormat('en', { timeZone: 'Europe/Amsterdam', timeZoneName: 'longOffset' })
+    .formatToParts(asUtc).find(p => p.type === 'timeZoneName')?.value || ''
+  const om = offsetNaam.match(/([+-])(\d{2}):(\d{2})/)
+  const offsetMin = om ? (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3])) : 0
+  return new Date(asUtc.getTime() - offsetMin * 60000).toISOString()
+}
+
 // Zet een "HH:MM"-wandkloktijd uit de Ritmonitor-kolom "Tijdstip laatste actie"
 // om naar een ISO-timestamp. De datum is altijd de scrape-dag. Retourneert
 // null bij onparseerbaar of als geen van beide interpretaties plausibel is.
@@ -325,6 +342,21 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     if (!bestaandeMap.has(key)) bestaandeMap.set(key, r)
   }
 
+  // Shift_tijden ophalen voor dit depot + datum — shift_nr → 'HH:mm'.
+  // Dit is de leidende begintijd; postnl_start_werktijd wordt hieruit
+  // gevuld zodra een rit voor het eerst actief in de grid verschijnt.
+  const shiftMap = new Map()
+  {
+    const { data: shifts } = await supabase
+      .from('shift_tijden')
+      .select('shift_nr, starttijd')
+      .eq('depot', depotNaam)
+      .eq('datum', datum)
+    for (const s of shifts ?? []) {
+      shiftMap.set(Number(s.shift_nr), s.starttijd)
+    }
+  }
+
   const teUpdaten = []
   const teInserten = []
   const logRijen = []
@@ -460,7 +492,16 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       // (die kent de functie zelf niet). Onplausibel → terugval op laatst-gezien-tijd.
       const laatsteActieIso = nlTijdstipNaarIso(datum, r.postnl_laatste_actie, new Date(nu).getTime())
       const actieMs = laatsteActieIso ? new Date(laatsteActieIso).getTime() : null
-      const startMs = r.postnl_start_werktijd ? new Date(r.postnl_start_werktijd).getTime() : null
+      // Plausibiliteitcheck: shift_tijden is de echte begintijd. postnl_start_werktijd
+      // is alleen een "eerste detectie"-markering en kan uren ná de echte start liggen
+      // (rit al klaar bij eerste polling — zie rit #647). Gebruik shiftMap als primaire
+      // startMs; val terug op postnl_start_werktijd als er geen shift-data is.
+      const shiftNrVerdwenen = Number(String(r.ritnummer).charAt(0))
+      const shiftTijdStrVerdwenen = shiftNrVerdwenen ? shiftMap.get(shiftNrVerdwenen) : null
+      const shiftIsoVerdwenen = shiftTijdStrVerdwenen ? shiftTijdNaarIso(datum, shiftTijdStrVerdwenen) : null
+      const startMs = shiftIsoVerdwenen
+        ? new Date(shiftIsoVerdwenen).getTime()
+        : (r.postnl_start_werktijd ? new Date(r.postnl_start_werktijd).getTime() : null)
       const actiePlausibel = actieMs !== null && (startMs === null || actieMs >= startMs)
       const eindtijd = actiePlausibel ? laatsteActieIso : (r.postnl_monitor_opgehaald || nu)
 
