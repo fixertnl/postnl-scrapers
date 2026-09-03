@@ -411,6 +411,12 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       ...(rit.stopsTeDoen !== null && {
         status: stopsTeDoenBevestigdNul ? 'gereden' : 'bezig',
       }),
+      // Zelfherstellend: `shift` wordt alleen bij het aanmaken van een rij gezet
+      // (zie teInserten hieronder), nooit meer bij latere updates — een bestaande
+      // ad-rit-rij die vóór deze fix is aangemaakt houdt anders voor altijd zijn
+      // oude/foute shiftcijfer. Op elke poll opnieuw op null zetten voor ad-ritten
+      // corrigeert dat vanzelf voor elke nog actief gepollde rit.
+      ...(isAdKanaal(rit.kanaal) && { shift: null }),
     }
 
     // Starttijd: eerste sync waarbij chauffeur een stop heeft afgeleverd.
