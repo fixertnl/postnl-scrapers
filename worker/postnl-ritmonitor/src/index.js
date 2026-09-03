@@ -77,6 +77,24 @@ function normaliseerRitnummer(value) {
   return digits ? String(parseInt(digits, 10)) : ''
 }
 
+// Reserve-ritten: 4-cijferig ritnummer, of het "shift"-cijfer (het eerste cijfer
+// van het ritnummer) is '9' — PostNL's eigen conventie voor reservechauffeurs
+// zonder vaste dienst. shift_tijden (matransport) kent alleen shift 1-6, dus een
+// reserve-rit heeft nooit een geldige shift-begintijd — de begintijd komt in
+// plaats daarvan uit de eerst gelezen "laatste actie"-tijd, niet het loutere
+// detectiemoment (zie opslaanMonitorInSupabase hieronder).
+function isReserveRitnummer(ritnummer) {
+  const s = String(ritnummer || '')
+  return s.length === 4 || s.charAt(0) === '9'
+}
+
+// Ad-ritten (avondritten): kanaal-code 'AD' uit de Ritmonitor-kolom "Kanaal".
+// Hebben geen shift (geen shift_tijden-data voor avondritten) en een vaste
+// begintijd van 17:00.
+function isAdKanaal(kanaal) {
+  return kanaal === 'AD'
+}
+
 function toNumber(value) {
   if (!value) return null
   const n = Number(String(value).trim().replace(/\./g, '').replace(',', '.'))
@@ -321,7 +339,10 @@ async function leesRitmonitor(page) {
         stopsTotaal:     toNumber(r.stopsTotaal),
         stopsTeDoen:     toNumber(r.stopsTeDoen),
         brievenbusstops: toNumber(r.brievenbusstops),
-        shift:           ritnummer.charAt(0) || null,
+        // Ad-ritten (avond, kanaal AD) krijgen geen shiftlabel — er is geen
+        // shift_tijden-data voor avondritten, en het eerste ritnummer-cijfer
+        // zou anders per ongeluk een echte shift-badge/-tijd suggereren.
+        shift:           isAdKanaal(r.kanaal) ? null : (ritnummer.charAt(0) || null),
       }
     })
 }
@@ -393,13 +414,24 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     }
 
     // Starttijd: eerste sync waarbij chauffeur een stop heeft afgeleverd.
+    // Reserve-ritten (isReserveRitnummer) hebben geen shift_tijden-begintijd
+    // (die tabel kent alleen shift 1-6) — voor hen gebruiken we daarom niet het
+    // loutere detectiemoment, maar de eerst gelezen "laatste actie"-tijd zelf.
+    // Ad-ritten (isAdKanaal, avond) hebben een vaste begintijd van 17:00 — er
+    // is geen shift_tijden-data voor avondritten om op terug te vallen.
     if (
       rit.stopsTeDoen !== null &&
       rit.stopsTotaal !== null &&
       rit.stopsTeDoen < rit.stopsTotaal &&
       !existing?.postnl_start_werktijd
     ) {
-      velden.postnl_start_werktijd = nu
+      if (isReserveRitnummer(rit.ritnummer)) {
+        velden.postnl_start_werktijd = nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()) || nu
+      } else if (isAdKanaal(rit.kanaal)) {
+        velden.postnl_start_werktijd = shiftTijdNaarIso(datum, '17:00') || nu
+      } else {
+        velden.postnl_start_werktijd = nu
+      }
     }
 
     // Eindtijd: continu bijgewerkt naar de laatst gelezen "tijdstip laatste actie",
@@ -496,7 +528,13 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       // is alleen een "eerste detectie"-markering en kan uren ná de echte start liggen
       // (rit al klaar bij eerste polling — zie rit #647). Gebruik shiftMap als primaire
       // startMs; val terug op postnl_start_werktijd als er geen shift-data is.
-      const shiftNrVerdwenen = Number(String(r.ritnummer).charAt(0))
+      // Reserve-ritten (isReserveRitnummer) slaan de shiftMap-lookup bewust over: het
+      // eerste ritnummer-cijfer van een 4-cijferig reserve-ritnummer kan toevallig
+      // binnen een echte shift 1-6 vallen en zou dan diens begintijd lenen — voor
+      // reserve-ritten is postnl_start_werktijd zelf al de juiste bron (door
+      // opslaanMonitorInSupabase hierboven gevuld met de eerste "laatste actie"-tijd,
+      // niet het detectiemoment).
+      const shiftNrVerdwenen = isReserveRitnummer(r.ritnummer) ? null : Number(String(r.ritnummer).charAt(0))
       const shiftTijdStrVerdwenen = shiftNrVerdwenen ? shiftMap.get(shiftNrVerdwenen) : null
       const shiftIsoVerdwenen = shiftTijdStrVerdwenen ? shiftTijdNaarIso(datum, shiftTijdStrVerdwenen) : null
       const startMs = shiftIsoVerdwenen

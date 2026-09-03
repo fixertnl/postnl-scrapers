@@ -38,6 +38,15 @@ Elke run logt ook diagnostisch naar `ritmonitor_log` (matransport migration_v111
 
 **Gebruikt door (in `fixertnl/matransport`):** `src/pages/Ritten/RitDetail.jsx`/`index.jsx` (live werktijd-timer + weergave via `postnl_eind_werktijd`; begintijd komt uit `shift_tijden` direct), `src/pages/Financien/index.jsx` (`getRitUren()`, prioriteit: dagrapport-scan → shift_tijden + `postnl_eind_werktijd` → null; `postnl_start_werktijd` is bewust geen fallback meer) en `src/lib/rittenMaandExport.js` (overwerkberekening). `postnl_uren` (AI-gescand dagrapport) heeft altijd voorrang boven de ritmonitor-tijden.
 
+### Reserve- en ad-ritten — afwijkende `shift`/`postnl_start_werktijd`-behandeling (issue #107)
+
+`shift_tijden` (matransport) kent alleen shift 1-6 (uit de wekelijkse shifttijden-mail). Twee categorieën ritten vallen daarbuiten en kregen tot issue #107 een verkeerde `shift`/begintijd:
+
+- **Reserve-ritten** — `isReserveRitnummer(ritnummer)`: een 4-cijferig ritnummer, of het eerste cijfer van het ritnummer is `9`. Reservechauffeurs hebben geen vaste shift, dus geen `shift_tijden`-match. **Begintijd**: bij de eerste detectie (`stopsTeDoen < stopsTotaal` en nog geen `postnl_start_werktijd`) wordt niet het detectiemoment (`nu`) gebruikt, maar de op dat moment gelezen "Tijdstip laatste actie" zelf (via `nlTijdstipNaarIso()`), met terugval op `nu` als die tekst onparseerbaar is. Reden: het detectiemoment kan een willekeurige pollingtijd na de echte eerste bezorging zijn; "laatste actie" bij eerste detectie ligt er dichter tegenaan. Dezelfde uitsluiting geldt in het "verdwenen-uit-grid"-pad — de shiftMap-lookup wordt voor reserve-ritten overgeslagen (een 4-cijferig ritnummer kan toevallig met zijn eerste cijfer een échte shift 1-6 raken en zou dan diens begintijd lenen), `postnl_start_werktijd` is daar al de juiste bron.
+- **Ad-ritten (avond)** — `isAdKanaal(kanaal)`: kanaal-code `AD`. Krijgen `shift: null` (geen shiftlabel — er is toch geen shift_tijden-data voor avondritten) en een **vaste begintijd van 17:00** (`shiftTijdNaarIso(datum, '17:00')`) bij eerste detectie, in plaats van het detectiemoment.
+
+**Frontend-kant (`fixertnl/matransport`):** `src/lib/ritSoort.js`'s `isReserveRit(rit)` (zelfde regel, `String(ritnummer).length === 4 || String(shift) === '9'`) sluit reserve-ritten uit van elke `shift_tijden`-lookup in `RitDetail.jsx`, `Ritten/index.jsx` en `Financien/index.jsx` — zonder die uitsluiting kan een 4-cijferig reserve-ritnummer alsnog de begintijd van een echte shift 1-6 lenen. Ad-ritten hebben dit probleem niet zodra `shift` hier `null` is: elke `rit.shift &&`-gate valt dan vanzelf weg en de UI toont direct `postnl_start_werktijd` (dus 17:00).
+
 ## Trigger-pad (GitHub Actions, niet VPS)
 
 ```
