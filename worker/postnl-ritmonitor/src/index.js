@@ -420,29 +420,23 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     }
 
     // Starttijd: eerste sync waarbij chauffeur een stop heeft afgeleverd.
-    // postnl_start_werktijd is sowieso alleen een fallback (shift_tijden is
-    // leidend voor DH/WVN-ritten met een shiftnummer) — voor élk ritsoort waar
-    // dit veld dus wél als weergegeven begintijd kan eindigen (RTM, @Home,
-    // reserve-ritten, of een DH/WVN-rit zonder shift_tijden-data) gebruiken we
-    // daarom niet het loutere detectiemoment (`nu`, kan een willekeurige
-    // pollingtijd ná de echte eerste bezorging zijn), maar de op dát moment
-    // gelezen "Tijdstip laatste actie" zelf (via nlTijdstipNaarIso()), met
-    // terugval op `nu` als die tekst onparseerbaar is. Ad-ritten (isAdKanaal,
-    // avond) zijn de enige uitzondering: die krijgen een vaste begintijd van
-    // 17:00 — er is geen shift_tijden-data voor avondritten om op terug te
-    // vallen, en "laatste actie" bij eerste detectie is voor hen geen goede
-    // proxy (avondritten beginnen per definitie om 17:00, ongeacht wanneer de
-    // eerste stop bezorgd werd).
+    // Reserve-ritten (isReserveRitnummer) hebben geen shift_tijden-begintijd
+    // (die tabel kent alleen shift 1-6) — voor hen gebruiken we daarom niet het
+    // loutere detectiemoment, maar de eerst gelezen "laatste actie"-tijd zelf.
+    // Ad-ritten (isAdKanaal, avond) hebben een vaste begintijd van 17:00 — er
+    // is geen shift_tijden-data voor avondritten om op terug te vallen.
     if (
       rit.stopsTeDoen !== null &&
       rit.stopsTotaal !== null &&
       rit.stopsTeDoen < rit.stopsTotaal &&
       !existing?.postnl_start_werktijd
     ) {
-      if (isAdKanaal(rit.kanaal)) {
+      if (isReserveRitnummer(rit.ritnummer)) {
+        velden.postnl_start_werktijd = nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()) || nu
+      } else if (isAdKanaal(rit.kanaal)) {
         velden.postnl_start_werktijd = shiftTijdNaarIso(datum, '17:00') || nu
       } else {
-        velden.postnl_start_werktijd = nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()) || nu
+        velden.postnl_start_werktijd = nu
       }
     }
 
