@@ -152,6 +152,15 @@ async function leesShift(page, shift, depotHostname) {
       function cel(row, cls) {
         return row.querySelector(`td.${cls}`)?.getAttribute('title')?.trim() || ''
       }
+      // Zelfde als cel(), maar valt terug op de zichtbare celtekst. Mendix zet
+      // lang niet op elke kolom een title-attribuut — de Ritduur-kolom heeft er
+      // geen, waardoor cel() daar altijd '' teruggaf terwijl de waarde gewoon
+      // in de cel stond.
+      function celTekst(row, cls) {
+        const td = row.querySelector(`td.${cls}`)
+        if (!td) return ''
+        return (td.getAttribute('title') || td.textContent || '').trim()
+      }
       // th[title="Ritten"] is in the SHIFT GRID header (shows rit count per shift).
       // We need the rit DETAIL grid — exclude the shift grid's content divs.
       const shiftGrid = document.querySelector('.mx-name-Shift_Grid_1')
@@ -186,9 +195,11 @@ async function leesShift(page, shift, depotHostname) {
         volume:          cel(row, 'mx-name-column13'),
         brievenbusstops: cel(row, 'mx-name-column17'),
         gewicht:         cel(row, 'mx-name-column14'),
-        duur:            duurCol ? cel(row, duurCol) : '',
+        duur:            duurCol ? celTekst(row, duurCol) : '',
       }))
-      const f = mapped[0]
+      // Sample een rij die daadwerkelijk een rit is — mapped[0] is vaak een
+      // lege rij uit een van de andere grids en zegt dus niets.
+      const f = mapped.find(r => /^\d{3,4}/.test(r.ritnaam || '')) || mapped[0]
       // Vindt de regex de kolom niet, log dan ALLE headers — anders is dit vanaf
       // hier blind debuggen zonder toegang tot het portaal.
       const headerDump = duurCol
