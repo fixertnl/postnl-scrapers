@@ -69,6 +69,35 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null
 }
 
+// Normaliseert de geplande ritduur uit het Dagplanning-grid naar "H:MM".
+// Het portaal is niet consistent in notatie, dus geaccepteerd worden o.a.
+// "5:33", "5.33", "5,33", "5:33:00", "5u33", "5 uur 33" en "333" (minuten).
+// Alles wat geen plausibele duur oplevert wordt null — liever geen waarde dan
+// een verkeerde, want hier hangt straks een eindtijd-berekening aan.
+function normaliseerDuur(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+
+  const hhmm = raw.match(/^(\d{1,2})\s*(?::|\.|,|u|uur)\s*(\d{1,2})(?::\d{1,2})?$/i)
+  if (hhmm) {
+    const uren = parseInt(hhmm[1], 10)
+    const min = parseInt(hhmm[2], 10)
+    if (min > 59 || uren > 23) return null
+    return `${uren}:${String(min).padStart(2, '0')}`
+  }
+
+  // Kaal getal = minuten (bv. "333" → 5:33). Onder de 15 min of boven de 24 uur
+  // is het vrijwel zeker geen ritduur maar een andere kolom die we per ongeluk lezen.
+  const minuten = raw.match(/^(\d{1,4})$/)
+  if (minuten) {
+    const m = parseInt(minuten[1], 10)
+    if (m < 15 || m > 24 * 60) return null
+    return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`
+  }
+
+  return null
+}
+
 // Converts DD-MM-YYYY label to YYYY-MM-DD
 function labelNaarDatum(label) {
   const [dag, maand, jaar] = label.split('-')
@@ -129,6 +158,21 @@ async function leesShift(page, shift, depotHostname) {
       const divs = Array.from(document.querySelectorAll('.mx-grid-content'))
         .filter(d => !shiftGrid || !shiftGrid.contains(d))
       const rows = divs.flatMap(d => Array.from(d.querySelectorAll('tbody tr[data-id]')))
+
+      // Duur-kolom (geplande ritduur volgens PostNL) dynamisch opzoeken via de
+      // header-titel — zelfde aanpak als de Brievenbuss-kolom in de ritmonitor.
+      // Bewust NIET op een vast kolomnummer: de overige kolommen hier (7/8/11-14/17)
+      // zijn ooit handmatig afgeleid en breken stil bij een Mendix-herschikking.
+      const alleHeaders = Array.from(divs.flatMap(
+        d => Array.from(d.querySelectorAll('thead th'))
+      ))
+      const duurTh = alleHeaders.find(
+        h => /(^|\b)(duur|uren|rittijd)(\b|$)/i.test(h.getAttribute('title') || h.textContent || '')
+      )
+      const duurCol = duurTh
+        ? Array.from(duurTh.classList).find(c => c.startsWith('mx-name-column'))
+        : null
+
       const mapped = rows.map(row => ({
         ritnaam:         cel(row, 'mx-name-column7'),
         chauffeur:       cel(row, 'mx-name-column8'),
@@ -137,11 +181,19 @@ async function leesShift(page, shift, depotHostname) {
         volume:          cel(row, 'mx-name-column13'),
         brievenbusstops: cel(row, 'mx-name-column17'),
         gewicht:         cel(row, 'mx-name-column14'),
+        duur:            duurCol ? cel(row, duurCol) : '',
       }))
       const f = mapped[0]
+      // Vindt de regex de kolom niet, log dan ALLE headers — anders is dit vanaf
+      // hier blind debuggen zonder toegang tot het portaal.
+      const headerDump = duurCol
+        ? `duurCol=${duurCol} (header "${(duurTh.getAttribute('title') || duurTh.textContent || '').trim()}")`
+        : `duurCol=NIET GEVONDEN, beschikbare headers: ${alleHeaders
+            .map(h => (h.getAttribute('title') || h.textContent || '').trim())
+            .filter(Boolean).join(' | ')}`
       return {
         rows: mapped,
-        debug: `${rows.length} rijen van ${divs.length} non-shift grids, eerste={ritnaam:"${f?.ritnaam}",stops:"${f?.stops}"}`,
+        debug: `${rows.length} rijen van ${divs.length} non-shift grids, eerste={ritnaam:"${f?.ritnaam}",stops:"${f?.stops}",duur:"${f?.duur}"}; ${headerDump}`,
       }
     })
     console.log(`[DEBUG shift ${shift}] ${result.debug}`)
@@ -164,6 +216,7 @@ async function leesShift(page, shift, depotHostname) {
         volume:          r.volume || null,
         brievenbusstops: toNumber(r.brievenbusstops),
         gewicht:         r.gewicht || null,
+        duur:            normaliseerDuur(r.duur),
         shift:           ritnummer.charAt(0) || shift,
       }
     })
@@ -210,6 +263,7 @@ async function opslaanInSupabase(alleRitten, datum, depotNaam, markeerGereden = 
       postnl_volume:           rit.volume,
       postnl_briefbusstops:    rit.brievenbusstops,
       postnl_gewicht:          rit.gewicht,
+      postnl_geplande_duur:    rit.duur,
       postnl_chauffeur:        rit.chauffeur,
       postnl_shift:            rit.shift,
       postnl_ritnaam:          rit.ritnaam,
