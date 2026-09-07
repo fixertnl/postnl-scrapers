@@ -78,7 +78,25 @@ function normaliseerDuur(value) {
   const raw = String(value || '').trim()
   if (!raw) return null
 
-  const hhmm = raw.match(/^(\d{1,2})\s*(?::|\.|,|u|uur)\s*(\d{1,2})(?::\d{1,2})?$/i)
+  // "5u 27m" is wat het portaal daadwerkelijk toont (bevestigd 2026-09-07);
+  // ook "5u27m", "5 uur 27 min" en "5u" (zonder minuten) worden geaccepteerd.
+  const uurMin = raw.match(/^(\d{1,2})\s*u(?:ur)?\s*(?:(\d{1,2})\s*m(?:in)?\.?)?$/i)
+  if (uurMin) {
+    const uren = parseInt(uurMin[1], 10)
+    const min = uurMin[2] ? parseInt(uurMin[2], 10) : 0
+    if (min > 59 || uren > 23) return null
+    return `${uren}:${String(min).padStart(2, '0')}`
+  }
+
+  // Alleen minuten: "45m", "45 min"
+  const alleenMin = raw.match(/^(\d{1,3})\s*m(?:in)?\.?$/i)
+  if (alleenMin) {
+    const m = parseInt(alleenMin[1], 10)
+    if (m > 24 * 60) return null
+    return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`
+  }
+
+  const hhmm = raw.match(/^(\d{1,2})\s*(?::|\.|,)\s*(\d{1,2})(?::\d{1,2})?$/)
   if (hhmm) {
     const uren = parseInt(hhmm[1], 10)
     const min = parseInt(hhmm[2], 10)
