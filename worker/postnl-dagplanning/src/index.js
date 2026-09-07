@@ -166,28 +166,33 @@ async function leesShift(page, shift, depotHostname) {
       const shiftGrid = document.querySelector('.mx-name-Shift_Grid_1')
       const divs = Array.from(document.querySelectorAll('.mx-grid-content'))
         .filter(d => !shiftGrid || !shiftGrid.contains(d))
-      const rows = divs.flatMap(d => Array.from(d.querySelectorAll('tbody tr[data-id]')))
-
       // Duur-kolom (geplande ritduur volgens PostNL) dynamisch opzoeken via de
       // header-titel — zelfde aanpak als de Brievenbuss-kolom in de ritmonitor.
       // Bewust NIET op een vast kolomnummer: de overige kolommen hier (7/8/11-14/17)
       // zijn ooit handmatig afgeleid en breken stil bij een Mendix-herschikking.
-      const alleHeaders = Array.from(divs.flatMap(
-        d => Array.from(d.querySelectorAll('thead th'))
-      ))
-      // De kolom heet in het portaal "Ritduur" (bevestigd via de header-dump
-      // hieronder op 2026-09-07). Géén \b vóór "duur" gebruiken: in "Ritduur"
-      // staat er geen woordgrens tussen "Rit" en "duur", dus dat matcht niet.
-      // De losse varianten blijven als terugval staan voor als PostNL het label
-      // ooit wijzigt.
-      const duurTh = alleHeaders.find(
-        h => /ritduur|rittijd|\bduur\b|\buren\b/i.test(h.getAttribute('title') || h.textContent || '')
-      )
-      const duurCol = duurTh
-        ? Array.from(duurTh.classList).find(c => c.startsWith('mx-name-column'))
-        : null
+      //
+      // ⚠️ PER GRID opzoeken, niet over alle grids samen. Er staan hier vier
+      // .mx-grid-content-divs op de pagina en dezelfde logische kolom heeft per
+      // grid een ánder mx-name-columnN. Zoek je de header globaal en pas je die
+      // klasse toe op rijen uit elk grid, dan lees je in het rit-grid een kolom
+      // die daar iets anders (of niets) betekent — precies waarom dit eerst
+      // stil leeg bleef.
+      //
+      // Het label is "Ritduur". Géén \b vóór "duur" gebruiken: in "Ritduur"
+      // staat geen woordgrens tussen "Rit" en "duur". De losse varianten blijven
+      // als terugval staan voor als PostNL het label ooit wijzigt.
+      const DUUR_RE = /ritduur|rittijd|\bduur\b|\buren\b/i
+      function duurKolomVan(grid) {
+        const th = Array.from(grid.querySelectorAll('thead th')).find(
+          h => DUUR_RE.test(h.getAttribute('title') || h.textContent || '')
+        )
+        return th ? Array.from(th.classList).find(c => c.startsWith('mx-name-column')) : null
+      }
 
-      const mapped = rows.map(row => ({
+      const perGrid = divs.map(d => ({ duurCol: duurKolomVan(d), rows: Array.from(d.querySelectorAll('tbody tr[data-id]')) }))
+      const rows = perGrid.flatMap(g => g.rows)
+
+      const mapped = perGrid.flatMap(({ duurCol, rows: gridRows }) => gridRows.map(row => ({
         ritnaam:         cel(row, 'mx-name-column7'),
         chauffeur:       cel(row, 'mx-name-column8'),
         stops:           cel(row, 'mx-name-column11'),
@@ -196,17 +201,19 @@ async function leesShift(page, shift, depotHostname) {
         brievenbusstops: cel(row, 'mx-name-column17'),
         gewicht:         cel(row, 'mx-name-column14'),
         duur:            duurCol ? celTekst(row, duurCol) : '',
-      }))
-      // Sample een rij die daadwerkelijk een rit is — mapped[0] is vaak een
-      // lege rij uit een van de andere grids en zegt dus niets.
-      const f = mapped.find(r => /^\d{3,4}/.test(r.ritnaam || '')) || mapped[0]
-      // Vindt de regex de kolom niet, log dan ALLE headers — anders is dit vanaf
-      // hier blind debuggen zonder toegang tot het portaal.
-      const headerDump = duurCol
-        ? `duurCol=${duurCol} (header "${(duurTh.getAttribute('title') || duurTh.textContent || '').trim()}")`
-        : `duurCol=NIET GEVONDEN, beschikbare headers: ${alleHeaders
-            .map(h => (h.getAttribute('title') || h.textContent || '').trim())
-            .filter(Boolean).join(' | ')}`
+      })))
+      // Sample een rij die écht een rit is: ritnaam-patroon én een gevulde
+      // stops-cel. Alleen op ritnaam filteren pakt nog steeds rijen uit een
+      // ander grid, die daarna toch wegvallen in de filter hieronder.
+      const f = mapped.find(r => /^\d{3,4}/.test(r.ritnaam || '') && r.stops) || mapped[0]
+      // Vindt de regex de kolom nergens, log dan ALLE headers per grid — anders
+      // is dit vanaf hier blind debuggen zonder toegang tot het portaal.
+      const headerDump = perGrid.some(g => g.duurCol)
+        ? `duurCol per grid: ${perGrid.map((g, i) => `#${i}=${g.duurCol || '-'}(${g.rows.length}r)`).join(' ')}`
+        : `duurCol=NIET GEVONDEN, headers per grid: ${divs.map((d, i) => `#${i}[${
+            Array.from(d.querySelectorAll('thead th'))
+              .map(h => (h.getAttribute('title') || h.textContent || '').trim())
+              .filter(Boolean).join(' | ')}]`).join(' ')}`
       return {
         rows: mapped,
         debug: `${rows.length} rijen van ${divs.length} non-shift grids, eerste={ritnaam:"${f?.ritnaam}",stops:"${f?.stops}",duur:"${f?.duur}"}; ${headerDump}`,
