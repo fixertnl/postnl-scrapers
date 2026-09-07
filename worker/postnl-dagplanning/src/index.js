@@ -166,8 +166,13 @@ async function leesShift(page, shift, depotHostname) {
       const alleHeaders = Array.from(divs.flatMap(
         d => Array.from(d.querySelectorAll('thead th'))
       ))
+      // De kolom heet in het portaal "Ritduur" (bevestigd via de header-dump
+      // hieronder op 2026-09-07). Géén \b vóór "duur" gebruiken: in "Ritduur"
+      // staat er geen woordgrens tussen "Rit" en "duur", dus dat matcht niet.
+      // De losse varianten blijven als terugval staan voor als PostNL het label
+      // ooit wijzigt.
       const duurTh = alleHeaders.find(
-        h => /(^|\b)(duur|uren|rittijd)(\b|$)/i.test(h.getAttribute('title') || h.textContent || '')
+        h => /ritduur|rittijd|\bduur\b|\buren\b/i.test(h.getAttribute('title') || h.textContent || '')
       )
       const duurCol = duurTh
         ? Array.from(duurTh.classList).find(c => c.startsWith('mx-name-column'))
