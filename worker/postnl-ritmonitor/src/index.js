@@ -607,7 +607,7 @@ async function syncMonitorDepot(depot) {
   await browser.close().catch(() => {})
   const videoPath = await bewaarSessieVideo(video, depot.naam)
 
-  if (fout) { fout.videoPath = videoPath; throw fout }
+  if (fout) { fout.videoPath = videoPath; fout.lezingen = lezingen; throw fout }
   return { rijen: rijenAantal, lezingen, videoPath }
 }
 
@@ -674,17 +674,22 @@ async function syncRitmonitor() {
   const mislukt = []
   let rijenTotaal = 0
   const videoPaths = []
+  // Lezingen per depot gaan naar worker_run_log.lezingen — de wachtdog
+  // check_ritmonitor_eindtijd() (matransport) alarmeert als het er < 3 worden.
+  const lezingenPerDepot = {}
   const uitkomsten = await Promise.allSettled(DEPOTS.map(depot => syncMonitorDepot(depot)))
   uitkomsten.forEach((uitkomst, i) => {
     const depot = DEPOTS[i]
     if (uitkomst.status === 'fulfilled') {
       const { rijen, lezingen, videoPath } = uitkomst.value
       rijenTotaal += rijen
+      lezingenPerDepot[depot.naam] = lezingen
       console.log(`[${depot.naam}] ${lezingen} lezingen in deze run`)
       if (videoPath) videoPaths.push({ depot: depot.naam, storage_path: videoPath })
     } else {
       const error = uitkomst.reason
       mislukt.push({ depot: depot.naam, fout: error.message })
+      lezingenPerDepot[depot.naam] = error.lezingen ?? 0
       if (error.videoPath) videoPaths.push({ depot: depot.naam, storage_path: error.videoPath })
       console.error(`[${depot.naam}] Ritmonitor mislukt (andere depots gaan door):`, error.message)
     }
@@ -692,7 +697,7 @@ async function syncRitmonitor() {
 
   if (mislukt.length === DEPOTS.length) {
     await eindeRunLog(runLogId, {
-      status: 'mislukt', depots_ok: 0, depots_mislukt: mislukt, rijen_gelezen: rijenTotaal,
+      status: 'mislukt', depots_ok: 0, depots_mislukt: mislukt, rijen_gelezen: rijenTotaal, lezingen: lezingenPerDepot,
       foutmelding: `Alle depots faalden: ${mislukt.map(m => `${m.depot} (${m.fout})`).join('; ')}`,
       video_paths: videoPaths.length ? videoPaths : null,
     })
@@ -706,6 +711,7 @@ async function syncRitmonitor() {
     depots_ok: depotsOk,
     depots_mislukt: mislukt.length ? mislukt : null,
     rijen_gelezen: rijenTotaal,
+    lezingen: lezingenPerDepot,
     video_paths: videoPaths.length ? videoPaths : null,
   })
   if (mislukt.length) {
