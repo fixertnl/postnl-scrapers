@@ -20,10 +20,10 @@ test('nlTijdstipNaarIso: wintertijd rekent met UTC+1', () => {
   assert.equal(nlTijdstipNaarIso('2026-11-10', '10:00', Date.parse('2026-11-10T12:00:00Z')), '2026-11-10T09:00:00.000Z')
 })
 
-test('nlTijdstipNaarIso: tijd in de toekomst wordt verworpen, klein klokverschil niet', () => {
+test('nlTijdstipNaarIso: tijd in de toekomst wordt verworpen; klein klokverschil ongewijzigd overgenomen', () => {
   const nu = ms(nl(D, '16:00'))
   assert.equal(nlTijdstipNaarIso(D, '16:30', nu), null)
-  assert.equal(nlTijdstipNaarIso(D, '16:02', nu), nl(D, '16:00'))
+  assert.equal(nlTijdstipNaarIso(D, '16:02', nu), nl(D, '16:02'))
 })
 
 test('nlTijdstipNaarIso: tijd van gisteren vóór de start van de rit valt af (05-09 rit 220)', () => {

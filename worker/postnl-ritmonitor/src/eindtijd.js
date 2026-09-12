@@ -10,6 +10,8 @@
 
 // Hoeveel een "laatste actie" ná het scrape-moment mag liggen voordat hij als
 // onmogelijk wordt verworpen — vangt een klein klokverschil met PostNL's server.
+// Binnen de tolerantie wordt de registratie ongewijzigd overgenomen (niet
+// afgeknipt op ons scrape-moment): PostNL's tijd is de registratie, de onze niet.
 const TOEKOMST_TOLERANTIE_MS = 5 * 60000
 
 // Zet een "HH:MM"-wandkloktijd uit de Ritmonitor-kolom "Tijdstip laatste actie"
@@ -45,7 +47,7 @@ export function nlTijdstipNaarIso(datum, tekst, nuMs = Date.now(), timeZone = 'E
   const ms = alsUtc.getTime() - offsetMin * 60000
 
   if (ms > nuMs + TOEKOMST_TOLERANTIE_MS) return null
-  return new Date(Math.min(ms, nuMs)).toISOString()
+  return new Date(ms).toISOString()
 }
 
 // Bepaalt of deze poll postnl_eind_werktijd moet bijwerken. Retourneert de nieuwe

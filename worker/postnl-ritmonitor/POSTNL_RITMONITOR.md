@@ -42,11 +42,10 @@ Elke run logt ook diagnostisch naar `ritmonitor_log` (matransport migration_v111
   - Een tussenversie op 2026-09-12 had nog een grens van 90 min stilstand. Die is dezelfde dag geschrapt: ook een late registratie is een registratie.
   - Het verdwenen-pad viel tot 2026-09-12 bovendien terug op `postnl_monitor_opgehaald` als de registratie "onplausibel" leek (vóór de shift-begintijd). Die terugval is weg.
 
-  **Bekende beperking — de afsluit-registratie:** een rit blijft na de laatste levering in de Ritmonitor staan, soms uren (vastgesteld via de sessie-opname: 12-09 om ~19:10 stond 0221 er nog met laatste actie 13:50). Het afsluiten zet een laatste registratie, en kort daarna verdwijnt de rit uit de grid. Valt er tussen die registratie en het verdwijnen geen poll, dan zien we die registratie nooit. Gemeten 26-08 t/m 11-09 over ritten die tijdens de pollinguren verdwenen:
-  - 102 keer zagen we na een stille periode nog een registratie vlak vóór het verdwijnen;
-  - 343 keer stond de rit stil en was hij bij de volgende poll weg, zonder zichtbare registratie.
-
-  De gemiste registratie ligt dan tussen de laatste poll waarop de rit er nog stond en de eerste poll waarop hij weg was.
+  **De afsluit-registratie — daarom leest elke run de grid herhaaldelijk (sinds 2026-09-12):** een rit blijft na de laatste levering in de Ritmonitor staan, soms uren (vastgesteld via de sessie-opname: 12-09 om ~19:10 stond 0221 er nog met laatste actie 13:50). Het afsluiten zet een laatste registratie, en kort daarna verdwijnt de rit uit de grid. Valt er tussen die registratie en het verdwijnen geen lezing, dan zien we die registratie nooit. Gemeten 26-08 t/m 11-09 met één lezing per 7 min, over ritten die tijdens de pollinguren verdwenen: 102 keer zagen we na een stille periode nog een registratie vlak vóór het verdwijnen; 343 keer stond de rit stil en was hij bij de volgende lezing weg, zonder zichtbare registratie. Daarom leest `syncMonitorDepot()` nu binnen één run de grid opnieuw tot het venster om is (`RITMONITOR_VENSTER_SEC`, standaard 330 s) met `RITMONITOR_INTERVAL_SEC` (60 s) ertussen — elke lezing navigeert opnieuw via `openRitmonitor()` (bewezen pad, incl. OAuth-herlogin), niet via een ververs-knop in de grid. De depots draaien daarvoor tegelijk (`Promise.allSettled`, elk een eigen browser); na elkaar zou de run de 7-min-cron overschrijden. De workflow heeft een `concurrency`-groep zodat een uitgelopen run niet gelijktijdig met de volgende dezelfde ritten beschrijft.
+  - **Noodrem:** repository-variabele `RITMONITOR_VENSTER_SEC` op `0` (Settings → Secrets and variables → Actions → Variables) → één lezing per run, zonder code-wijziging. Gebruik dit als Akamai het verkeer gaat blokkeren (symptoom: `worker_run_log.depots_mislukt` met login-/time-outfouten bij beide depots).
+  - `ritmonitor_log` krijgt alleen een rij als er iets veranderde t.o.v. de vorige lezing (stops, registratie, status, start/eind) — identieke herhalingen worden niet gelogd, anders groeide de tabel zes keer zo snel.
+  - Wat na deze wijziging nog gemist kan worden: een registratie die binnen de 60 s tussen twee lezingen wordt gezet én waarna de rit vóór de volgende lezing al weg is, plus alles buiten de pollinguren (07:00–23:00) — dan blijft de laatst gezíene registratie staan.
 
   **Front-end-conventie** (`eindtijdOnbevestigd()` in matransport's `RitDetail.jsx`/`Financien/index.jsx`): zolang `status !== 'gereden'` is de eindtijd voorlopig. Een `!` achter de eindtijd verschijnt alleen als de rit dan ook nog van een vorige dag is. Baseer je nooit op "is `postnl_eind_werktijd` gevuld?" om te bepalen of een rit klaar is — gebruik `status === 'gereden'`.
   **Historie herberekend op 2026-09-12** (26-08 t/m 12-09, zonder 07-09) met `scripts/herbereken-eindtijden.js`. Dat script speelt elke rit na uit `ritmonitor_log`. Ter controle speelt het ook de oude regels na, en die reproduceerden 549 van de 552 toen opgeslagen eindtijden exact. De gegenereerde SQL en de terugdraai-SQL staan in `fixertnl/matransport`, `supabase/backfills/2026-09-12_ritmonitor_eindtijd/` (bewust niet hier: deze repo is publiek). Verander je de regel opnieuw, dan kun je hetzelfde script weer gebruiken.
@@ -84,8 +83,8 @@ pg_cron 'ritmonitor-7min' (elke 7 min, 07:00–23:00 Amsterdam, Supabase-DB van 
 
 ⚠️ **Check de live functiedefinitie van `trigger_ritmonitor()` in Supabase (`select pg_get_functiondef(oid) from pg_proc where proname = 'trigger_ritmonitor'`) als je hieraan twijfelt** — deze functie is ooit rechtstreeks in de database aangepast (dit trigger-pad), zonder een migratiebestand in `matransport` te raken. Vertrouw dus niet blind op wat matransport's migratiebestanden beweren.
 
-- **Timeout 10 minuten** (`timeout-minutes` in de workflow) — een run hoort in 1-2 min klaar te zijn.
-- **Geen skip-if-busy nodig** zoals bij de oude VPS-opzet — elke GitHub Actions-run krijgt zijn eigen geïsoleerde container, dus overlappende runs schrijven elkaar niet in de weg op procesniveau (al kunnen ze wel dezelfde DB-rijen raken bij een korte overlap — dezelfde dubbele-miss-bevestiging hierboven vangt dat af).
+- **Timeout 10 minuten** (`timeout-minutes` in de workflow) — een run duurt sinds het herhaald lezen (2026-09-12) ~6 min (`RITMONITOR_VENSTER_SEC` 330 s + opstarten), daarvóór 1-2 min.
+- **`concurrency: postnl-ritmonitor`, `cancel-in-progress: false`** (sinds 2026-09-12): hooguit één run tegelijk, een volgende trigger wacht. Voorheen was dat niet nodig (runs van 1-2 min overlapten nooit); nu een run bijna het hele 7-min-interval vult, zou een trage start anders gelijktijdig met de volgende run dezelfde ritten beschrijven.
 - **Nooit `on: schedule` gebruiken** — dat vuurt minuten tot uren te laat. De workflow triggert uitsluitend op `workflow_dispatch`.
 - **Geen sessie-hergebruik tussen runs** — elke run krijgt een vers container-filesystem, dus altijd een verse login (in tegenstelling tot de vroegere VPS-opzet, die een `storageState`-sessie hergebruikte). Zie de tijdzone-gotcha hieronder voor waarom dit relevant is.
 
@@ -130,7 +129,7 @@ Náást `--once` (wat GitHub Actions gebruikt) heeft `src/index.js` ook een daem
 
 ## Per-depot foutisolatie
 
-`syncRitmonitor()` loopt depots sequentieel af en isoleert fouten: één depot dat faalt (trage grid, sessie-redirect) stopt niet de hele run — de overige depots draaien gewoon door. Alleen als **alle** depots falen gooit de run alsnog een fout. Chauffeur-koppeling draait ook bij gedeeltelijk succes.
+`syncRitmonitor()` draait de depots tegelijk (`Promise.allSettled`, sinds 2026-09-12 — daarvóór na elkaar) en isoleert fouten: één depot dat faalt (trage grid, sessie-redirect) stopt niet de hele run — de overige depots draaien gewoon door. Binnen een depot geldt hetzelfde per lezing: faalt een lezing nadat er al één slaagde, dan stopt alleen het herhalen en telt wat al opgeslagen is. Alleen als **alle** depots falen gooit de run alsnog een fout. Chauffeur-koppeling draait ook bij gedeeltelijk succes.
 
 ## Run-monitoring (`worker_run_log`)
 

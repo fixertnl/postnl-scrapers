@@ -48,6 +48,17 @@ const CONFIG = {
   timezone: process.env.TZ || 'Europe/Amsterdam',
   headless: String(process.env.POSTNL_HEADLESS ?? 'true').toLowerCase() !== 'false',
   slowMo: Number(process.env.POSTNL_SLOWMO || 0),
+  // Herhaald uitlezen binnen één run (sinds 2026-09-12): de eindtijd is de laatste
+  // registratie van de dag, en die "afsluit-registratie" staat vaak maar kort in de
+  // grid voordat PostNL de rit eruit haalt. Met één lezing per 7 min werd hij in
+  // 343 van 445 gevallen gemist. Daarom leest elke run de grid opnieuw tot het
+  // venster om is (5,5 min: past vóór de volgende 7-min-trigger), met een pauze
+  // ertussen. Noodrem bij Akamai-/rate-problemen: RITMONITOR_VENSTER_SEC=0 als
+  // GitHub-variabele → één lezing per run, zoals vóór deze wijziging.
+  // Let op: een niet-bestaande GitHub-variabele komt binnen als '' (niet undefined),
+  // en Number('') is 0 — dat zou onbedoeld de noodrem zijn. Daarom ook '' → standaard.
+  vensterSec: Number(process.env.RITMONITOR_VENSTER_SEC || 330),
+  intervalSec: Number(process.env.RITMONITOR_INTERVAL_SEC || 60),
 }
 
 function requireEnv(name) {
@@ -412,12 +423,21 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     if (eindIso) velden.postnl_eind_werktijd = eindIso
 
     // Diagnostisch loggen: wat las de worker + welke beslissing nam hij voor deze rit.
+    // Alleen als er iets veranderde t.o.v. de vorige lezing — sinds het herhaald
+    // lezen (CONFIG.vensterSec) zou elke identieke herhaling het logboek anders
+    // zes keer zo snel laten groeien zonder informatie toe te voegen.
     const actie = !existing ? 'nieuw'
       : stopsTeDoenBevestigdNul ? 'eind-nul'
       : velden.postnl_start_werktijd ? 'start-gezet'
       : velden.postnl_eind_werktijd ? 'eind-bijgewerkt'
       : 'gelezen'
-    logRijen.push({
+    const veranderd = !existing
+      || existing.postnl_stops_totaal !== rit.stopsTotaal
+      || existing.postnl_stops_te_doen !== rit.stopsTeDoen
+      || (existing.postnl_laatste_actie ?? null) !== (rit.laatsteActie ?? null)
+      || (velden.status != null && existing.status !== velden.status)
+      || Boolean(velden.postnl_start_werktijd || velden.postnl_eind_werktijd)
+    if (veranderd) logRijen.push({
       ...runContext,
       ritnummer:     rit.ritnummer,
       stops_totaal:  rit.stopsTotaal,
@@ -547,16 +567,34 @@ async function syncMonitorDepot(depot) {
 
   const { browser, context, page } = await openDepotSessie(depot)
   let rijenAantal = 0
+  let lezingen = 0
   let fout = null
+  const deadline = Date.now() + CONFIG.vensterSec * 1000
   try {
     await page.waitForTimeout(1000)
-    await openRitmonitor(page, depot)
-    const rijen = await leesRitmonitor(page)
-    console.log(`[${depot.naam}] Ritmonitor: ${rijen.length} ritten gelezen`)
-    await opslaanMonitorInSupabase(rijen, vandaag, depot.naam)
+    // Herhaald lezen tot het venster om is (zie CONFIG.vensterSec). Elke lezing
+    // navigeert opnieuw naar de Ritmonitor via het bewezen pad (openRitmonitor:
+    // inclusief OAuth-herlogin) i.p.v. een onbekende ververs-knop in de grid.
+    // Een fout ná een geslaagde lezing stopt alleen de herhaling — wat al gelezen
+    // en opgeslagen is, telt.
+    for (;;) {
+      try {
+        await openRitmonitor(page, depot)
+        const rijen = await leesRitmonitor(page)
+        lezingen++
+        console.log(`[${depot.naam}] Ritmonitor lezing ${lezingen}: ${rijen.length} ritten gelezen`)
+        await opslaanMonitorInSupabase(rijen, vandaag, depot.naam)
+        rijenAantal = Math.max(rijenAantal, rijen.length)
+      } catch (error) {
+        if (lezingen === 0) throw error
+        console.error(`[${depot.naam}] Lezing ${lezingen + 1} mislukt, stop met herhalen:`, error.message)
+        break
+      }
+      if (Date.now() + CONFIG.intervalSec * 1000 > deadline) break
+      await page.waitForTimeout(CONFIG.intervalSec * 1000)
+    }
 
     if (depot.storageState) await context.storageState({ path: depot.storageState })
-    rijenAantal = rijen.length
   } catch (error) {
     console.error(`[${depot.naam}] Ritmonitor sync mislukt:`, error)
     fout = error
@@ -570,7 +608,7 @@ async function syncMonitorDepot(depot) {
   const videoPath = await bewaarSessieVideo(video, depot.naam)
 
   if (fout) { fout.videoPath = videoPath; throw fout }
-  return { rijen: rijenAantal, videoPath }
+  return { rijen: rijenAantal, lezingen, videoPath }
 }
 
 // Gestructureerd run-niveau-logboek in `worker_run_log` (migration_v150) —
@@ -629,20 +667,28 @@ async function syncRitmonitor() {
   // zie 12 aug 2026) kan de console-log wegvallen vóórdat 'ie geflushed is, terwijl
   // een DB-write via een losse request altijd aankomt of hard faalt (geen stille
   // dataverlies-situatie zoals bij een gebufferde stdout-stream).
+  //
+  // Depots draaien tegelijk (elk een eigen browser), niet na elkaar: sinds het
+  // herhaald lezen (CONFIG.vensterSec) duurt één depot bijna het hele venster,
+  // en na elkaar zou de run de 7-min-cron en de 10-min-timeout overschrijden.
   const mislukt = []
   let rijenTotaal = 0
   const videoPaths = []
-  for (const depot of DEPOTS) {
-    try {
-      const { rijen, videoPath } = await syncMonitorDepot(depot)
+  const uitkomsten = await Promise.allSettled(DEPOTS.map(depot => syncMonitorDepot(depot)))
+  uitkomsten.forEach((uitkomst, i) => {
+    const depot = DEPOTS[i]
+    if (uitkomst.status === 'fulfilled') {
+      const { rijen, lezingen, videoPath } = uitkomst.value
       rijenTotaal += rijen
+      console.log(`[${depot.naam}] ${lezingen} lezingen in deze run`)
       if (videoPath) videoPaths.push({ depot: depot.naam, storage_path: videoPath })
-    } catch (error) {
+    } else {
+      const error = uitkomst.reason
       mislukt.push({ depot: depot.naam, fout: error.message })
       if (error.videoPath) videoPaths.push({ depot: depot.naam, storage_path: error.videoPath })
-      console.error(`[${depot.naam}] Ritmonitor overgeslagen na fout (volgende depot gaat door):`, error.message)
+      console.error(`[${depot.naam}] Ritmonitor mislukt (andere depots gaan door):`, error.message)
     }
-  }
+  })
 
   if (mislukt.length === DEPOTS.length) {
     await eindeRunLog(runLogId, {
