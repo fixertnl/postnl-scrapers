@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "sync:once": "node src/index.js --once",
+    "test": "node --test \"test/*.test.js\"",
     "playwright:install": "playwright install chromium"
   },
   "dependencies": {

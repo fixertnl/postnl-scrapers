@@ -21,6 +21,7 @@ import fs from 'node:fs/promises'
 import { chromium } from 'playwright'
 import { createClient } from '@supabase/supabase-js'
 import { getDepots } from '../../credentials-shared/src/index.js'
+import { nlTijdstipNaarIso as tijdstipNaarIso, nieuweEindtijd } from './eindtijd.js'
 
 // Optionele proxy — PostNL's Akamai-beveiliging blokkeert het IP van de
 // scrape-omgeving bij te veel geautomatiseerd verkeer vanaf één vast adres.
@@ -118,40 +119,11 @@ function shiftTijdNaarIso(datum, tijd) {
   return new Date(asUtc.getTime() - offsetMin * 60000).toISOString()
 }
 
-// Zet een "HH:MM"-wandkloktijd uit de Ritmonitor-kolom "Tijdstip laatste actie"
-// om naar een ISO-timestamp. De datum is altijd de scrape-dag. Retourneert
-// null bij onparseerbaar of als geen van beide interpretaties plausibel is.
-//
-// LET OP — de tijdzone waarin deze tekst gerenderd wordt, wisselt: soms UTC,
-// soms NL-lokaal (CEST). Op 2026-08-24 was 't consistent UTC (gemeten door een
-// live scrape naast een live screenshot te leggen); nog geen 24u later, op
-// 2026-08-25, bleek 't zonder enige codewijziging omgeslagen naar NL-lokaal —
-// vermoedelijk hangt Mendix de tijdzone bij het inloggen aan de sessie, en
-// verandert dat zodra de hergebruikte `storageState`-sessie (zie
-// openDepotSessie) een keer opnieuw moet inloggen. Hardcoded op één
-// interpretatie gokken bleek dus niet houdbaar: dit rekent daarom BEIDE
-// interpretaties uit en kiest de plausibele — een "laatste actie" kan nooit
-// ná het scrape-moment (nuMs) liggen, dus die kandidaat valt af. Blijven er
-// twee over (bv. bij een echte UTC-tekst is "als-NL-lokaal" toevallig ook
-// niet in de toekomst, want 2 uur eerder), dan wint de meest recente — de
-// juiste interpretatie ligt vrijwel altijd dichter bij het scrape-moment dan
-// de foute (die 2 uur verder terug zou liggen).
+// "Tijdstip laatste actie" (HH:MM) → ISO-timestamp, in dezelfde tijdzone als de
+// browser-context rendert (timezoneId in openDepotSessie). Zie src/eindtijd.js
+// voor waarom hier niet meer tussen UTC en NL-lokaal gegokt wordt.
 function nlTijdstipNaarIso(datum, tekst, nuMs = Date.now()) {
-  const m = String(tekst || '').match(/(\d{1,2}):(\d{2})/)
-  if (!m) return null
-  const alsUtc = new Date(`${datum}T${m[1].padStart(2, '0')}:${m[2]}:00Z`)
-  if (Number.isNaN(alsUtc.getTime())) return null
-
-  const offsetNaam = new Intl.DateTimeFormat('en', { timeZone: CONFIG.timezone, timeZoneName: 'longOffset' })
-    .formatToParts(alsUtc).find(p => p.type === 'timeZoneName')?.value || ''
-  const om = offsetNaam.match(/([+-])(\d{2}):(\d{2})/)
-  const offsetMin = om ? (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3])) : 0
-  const alsNlLokaal = new Date(alsUtc.getTime() - offsetMin * 60000)
-
-  const kandidaten = [alsUtc, alsNlLokaal]
-    .filter(d => d.getTime() <= nuMs)
-    .sort((a, b) => b.getTime() - a.getTime())
-  return kandidaten[0]?.toISOString() ?? null
+  return tijdstipNaarIso(datum, tekst, nuMs, CONFIG.timezone)
 }
 
 async function loginPostnl(page, depot) {
@@ -440,23 +412,23 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       }
     }
 
-    // Eindtijd: continu bijgewerkt naar de laatst gelezen "tijdstip laatste actie",
-    // zolang de rit nog niet definitief 'gereden' is (niet pas ná bevestiging via
-    // bevestigd-nul of verdwenen-uit-grid hieronder). Reden: als de polling zelf
-    // ooit stopt — VPS-crash, dispatch-storing, per-depot-uitval, zie git-historie
-    // 2026-08-24 — vóórdat een van die twee paden kan vuren, bleef eind_werktijd
-    // voorheen voor altijd null, terwijl we allang een laatst bekende actie-tijd
-    // hadden. Nu blijft in elk geval de laatste gelezen waarde staan.
+    // Eindtijd: continu bijgewerkt naar de laatst gelezen "tijdstip laatste actie"
+    // (niet pas ná bevestiging via bevestigd-nul of verdwenen-uit-grid hieronder) —
+    // als de polling ooit stopt, blijft zo in elk geval de laatst bekende tijd staan.
+    // Ook ná 'gereden' (bevestigd-nul) blijft hij meelopen zolang de rit in de grid
+    // staat en de chauffeur nog acties doet — zie nieuweEindtijd() voor de regels en
+    // de ene grens die depot-acties uren later buiten de werktijd houdt.
     //
-    // BELANGRIJK: dit is dus niet per se een bevestigde eindtijd — pas zodra
-    // status === 'gereden' is die bevestigd (via bevestigd-nul of verdwenen-uit-
-    // grid). Zolang status 'bezig' blijft, is dit een voorlopige waarde (chauffeur
-    // kan nog bezig zijn — dit is dan gewoon zijn laatst bekende actie, geen
-    // afgeronde dienst). Front-end moet dat onderscheid tonen (bv. een "!" achter
-    // de tijd) zolang status niet 'gereden' is — zie RITTEN_ARCHITECTUUR.md.
-    if (existing?.postnl_start_werktijd && existing?.status !== 'gereden') {
-      const actieIso = nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime())
-      if (actieIso) velden.postnl_eind_werktijd = actieIso
+    // Zolang status niet 'gereden' is, is dit een voorlopige waarde (chauffeur kan
+    // nog bezig zijn); de front-end toont dat onderscheid — zie RITTEN_ARCHITECTUUR.md.
+    if (existing) {
+      const eindIso = nieuweEindtijd({
+        bestaand: existing,
+        stopsTeDoen: rit.stopsTeDoen,
+        laatsteActieIso: nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()),
+      })
+      // Vergelijken op tijdstip, niet op tekst: Supabase geeft '+00:00' terug, toISOString() 'Z'.
+      if (eindIso && Date.parse(eindIso) !== Date.parse(existing.postnl_eind_werktijd)) velden.postnl_eind_werktijd = eindIso
     }
 
     // Diagnostisch loggen: wat las de worker + welke beslissing nam hij voor deze rit.
