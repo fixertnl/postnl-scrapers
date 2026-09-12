@@ -43,6 +43,6 @@ jobs:
           KLANT_ID: ${{ secrets.KLANT_ID }}
           POSTNL_HEADLESS: 'true'
           # Noodrem: zet de repository-variabele RITMONITOR_VENSTER_SEC op 0 voor
-          # één lezing per run (gedrag van vóór 2026-09-12). Leeg = standaard 330.
+          # één lezing per run (gedrag van vóór 2026-09-12). Leeg = standaard 300.
           RITMONITOR_VENSTER_SEC: ${{ vars.RITMONITOR_VENSTER_SEC }}
         run: node src/index.js --once

@@ -52,12 +52,12 @@ const CONFIG = {
   // registratie van de dag, en die "afsluit-registratie" staat vaak maar kort in de
   // grid voordat PostNL de rit eruit haalt. Met één lezing per 7 min werd hij in
   // 343 van 445 gevallen gemist. Daarom leest elke run de grid opnieuw tot het
-  // venster om is (5,5 min: past vóór de volgende 7-min-trigger), met een pauze
+  // venster om is (5 min: met opstarten en inloggen ~6 min, past vóór de volgende 7-min-trigger), met een pauze
   // ertussen. Noodrem bij Akamai-/rate-problemen: RITMONITOR_VENSTER_SEC=0 als
   // GitHub-variabele → één lezing per run, zoals vóór deze wijziging.
   // Let op: een niet-bestaande GitHub-variabele komt binnen als '' (niet undefined),
   // en Number('') is 0 — dat zou onbedoeld de noodrem zijn. Daarom ook '' → standaard.
-  vensterSec: Number(process.env.RITMONITOR_VENSTER_SEC || 330),
+  vensterSec: Number(process.env.RITMONITOR_VENSTER_SEC || 300),
   intervalSec: Number(process.env.RITMONITOR_INTERVAL_SEC || 60),
 }
 
