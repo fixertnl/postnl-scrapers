@@ -2,16 +2,11 @@
 // zodat hij testbaar is (test/eindtijd.test.js) en het herstelscript
 // (scripts/herbereken-eindtijden.js) exact dezelfde regels gebruikt als de worker.
 // Zie POSTNL_RITMONITOR.md § Werkuren voor de achtergrond.
-
-// Hoe lang een rit met 0 stops te doen zonder nieuwe actie in de Ritmonitor mag
-// staan voordat een latere actie niet meer als werk van de chauffeur telt.
-// Na 0 stops doet de chauffeur vaak nog van alles (ophaalstops en retouren tellen
-// niet mee in "Stops te doen", daarna terugrijden en afmelden op het depot) —
-// stappen van 10-60 min. Een actie ná lange stilstand is in de praktijk een
-// depot-/systeemactie die vaak op dezelfde minuut bij meerdere ritten tegelijk
-// valt (bv. 09-09 Den Hoorn: 218 en 223 allebei om 21:56, 5-6 uur na hun laatste
-// levering). Gemeten over 26-08 t/m 11-09: 94% van de stappen na 0 is ≤ 60 min.
-export const NAWERK_MAX_STILSTAND_MIN = 90
+//
+// DE REGEL (besluit 2026-09-12, bepaalt de uitbetaling): de eindtijd is het laatste
+// "Tijdstip laatste actie" dat PostNL die dag voor de rit registreerde. Niets anders:
+// geen uitzondering voor "0 stops te doen", geen grens na stilstand, en nooit een
+// tijd die we zelf afleiden (zoals het moment waarop we de rit het laatst zagen).
 
 // Hoeveel een "laatste actie" ná het scrape-moment mag liggen voordat hij als
 // onmogelijk wordt verworpen — vangt een klein klokverschil met PostNL's server.
@@ -28,6 +23,12 @@ const TOEKOMST_TOLERANTIE_MS = 5 * 60000
 // dan 2 uur oud was bij het uitlezen werd als UTC gelezen en kwam precies 2 uur te
 // laat uit (bv. 29-08 rit 715: 17:50 opgeslagen als 19:50). Gemeten over 20.500
 // polls sinds 26-08: nooit een tekst die op UTC wees.
+//
+// De toekomst-check is ook de bescherming tegen een tijd van de VORIGE dag: vóór een
+// rit start toont de kolom soms nog die tijd (bv. om 07:15 al "16:36"). Op de
+// scrape-dag geplakt ligt die in de toekomst en valt hij af. Een tijd van gisteren die
+// vroeger op de dag lag dan het scrape-moment komt er wél door, maar telt alleen mee
+// als de rit al gestart is — en dan is er altijd al een latere echte registratie.
 //
 // Retourneert null bij onparseerbare tekst of een tijd die (buiten de tolerantie)
 // in de toekomst ligt.
@@ -50,42 +51,19 @@ export function nlTijdstipNaarIso(datum, tekst, nuMs = Date.now(), timeZone = 'E
 // Bepaalt of deze poll postnl_eind_werktijd moet bijwerken. Retourneert de nieuwe
 // ISO-waarde, of null als de eindtijd moet blijven staan.
 //
-//   bestaand         — de ritten-rij zoals vóór deze poll (postnl_start_werktijd,
-//                      postnl_eind_werktijd, postnl_stops_te_doen, status,
-//                      postnl_monitor_opgehaald = moment van de vorige poll)
-//   stopsTeDoen      — "Stops te doen" uit deze poll (null = onbekend)
+//   gestart          — de rit is gestart (postnl_start_werktijd staat, of wordt deze
+//                      poll gezet). Daarvóór kan de kolom nog een tijd van gisteren tonen.
+//   huidigeEindIso   — postnl_eind_werktijd zoals die nu in de database staat
 //   laatsteActieIso  — "Tijdstip laatste actie" uit deze poll, al via nlTijdstipNaarIso
 //
-// Regels:
-// 1. Pas vanaf het moment dat de rit gestart is (postnl_start_werktijd gezet).
-// 2. Met open stops volgt de eindtijd altijd de laatste actie — ook als de rit al op
-//    'gereden' stond (PostNL voegt soms stops toe aan een rit die al op 0 stond).
-// 3. De poll waarop de teller naar 0 gaat: altijd volgen (dat is de laatste levering).
-// 4. Daarna, met de teller op 0: blijven volgen, want de chauffeur is vaak nog bezig.
-//    Tot 2026-09-12 bevroor de eindtijd hier (status 'gereden' blokkeerde elke update),
-//    waardoor bij 37% van de ritten de eindtijd te vroeg stond, gemiddeld een uur. Wel
-//    met één grens: stond de rit bij de vorige poll al langer dan
-//    NAWERK_MAX_STILSTAND_MIN zonder actie, dan telt een latere actie niet meer.
-//    De stilstand wordt gemeten tot de vorige poll (wat we zeker weten), niet tot de
-//    nieuwe actie — zo telt een gat in de polling zelf niet als stilstand.
-export function nieuweEindtijd({ bestaand, stopsTeDoen, laatsteActieIso }) {
-  if (!bestaand?.postnl_start_werktijd || !laatsteActieIso) return null
-
-  const nogOpen = stopsTeDoen != null ? stopsTeDoen > 0 : bestaand.status !== 'gereden'
-  if (nogOpen) return laatsteActieIso
-
-  const vorigeTeDoen = bestaand.postnl_stops_te_doen
-  if (vorigeTeDoen == null || vorigeTeDoen > 0) return laatsteActieIso
-
-  const huidigMs = bestaand.postnl_eind_werktijd ? Date.parse(bestaand.postnl_eind_werktijd) : NaN
-  if (Number.isNaN(huidigMs)) return laatsteActieIso
-
+// De eindtijd gaat alleen vooruit: het is het maximum van alle registraties. In de
+// data (35.600 opeenvolgende polls, 26-08 t/m 12-09) liep een echte registratie nooit
+// terug; alleen de tijd-van-gisteren hierboven deed dat.
+export function nieuweEindtijd({ gestart, huidigeEindIso, laatsteActieIso }) {
+  if (!gestart || !laatsteActieIso) return null
   const actieMs = Date.parse(laatsteActieIso)
-  if (!(actieMs > huidigMs)) return null
-
-  const vorigePollMs = bestaand.postnl_monitor_opgehaald ? Date.parse(bestaand.postnl_monitor_opgehaald) : NaN
-  const stilstandMin = ((Number.isNaN(vorigePollMs) ? actieMs : vorigePollMs) - huidigMs) / 60000
-  if (stilstandMin > NAWERK_MAX_STILSTAND_MIN) return null
-
-  return laatsteActieIso
+  if (Number.isNaN(actieMs)) return null
+  const huidigMs = huidigeEindIso ? Date.parse(huidigeEindIso) : NaN
+  if (!Number.isNaN(huidigMs) && actieMs <= huidigMs) return null
+  return new Date(actieMs).toISOString()
 }

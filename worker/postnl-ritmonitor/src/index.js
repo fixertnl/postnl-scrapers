@@ -335,21 +335,6 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
     if (!bestaandeMap.has(key)) bestaandeMap.set(key, r)
   }
 
-  // Shift_tijden ophalen voor dit depot + datum — shift_nr → 'HH:mm'.
-  // Dit is de leidende begintijd; postnl_start_werktijd wordt hieruit
-  // gevuld zodra een rit voor het eerst actief in de grid verschijnt.
-  const shiftMap = new Map()
-  {
-    const { data: shifts } = await supabase
-      .from('shift_tijden')
-      .select('shift_nr, starttijd')
-      .eq('depot', depotNaam)
-      .eq('datum', datum)
-    for (const s of shifts ?? []) {
-      shiftMap.set(Number(s.shift_nr), s.starttijd)
-    }
-  }
-
   const teUpdaten = []
   const teInserten = []
   const logRijen = []
@@ -412,24 +397,19 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       }
     }
 
-    // Eindtijd: continu bijgewerkt naar de laatst gelezen "tijdstip laatste actie"
-    // (niet pas ná bevestiging via bevestigd-nul of verdwenen-uit-grid hieronder) —
-    // als de polling ooit stopt, blijft zo in elk geval de laatst bekende tijd staan.
-    // Ook ná 'gereden' (bevestigd-nul) blijft hij meelopen zolang de rit in de grid
-    // staat en de chauffeur nog acties doet — zie nieuweEindtijd() voor de regels en
-    // de ene grens die depot-acties uren later buiten de werktijd houdt.
+    // Eindtijd = het laatste "Tijdstip laatste actie" dat PostNL die dag voor deze rit
+    // registreerde (zie nieuweEindtijd). Op elke poll, ongeacht status of "stops te
+    // doen" — ook ná 'gereden' loopt hij door zolang de rit in de grid staat. Vanaf de
+    // poll waarop de rit start (ook als de starttijd deze poll pas gezet wordt).
     //
     // Zolang status niet 'gereden' is, is dit een voorlopige waarde (chauffeur kan
     // nog bezig zijn); de front-end toont dat onderscheid — zie RITTEN_ARCHITECTUUR.md.
-    if (existing) {
-      const eindIso = nieuweEindtijd({
-        bestaand: existing,
-        stopsTeDoen: rit.stopsTeDoen,
-        laatsteActieIso: nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()),
-      })
-      // Vergelijken op tijdstip, niet op tekst: Supabase geeft '+00:00' terug, toISOString() 'Z'.
-      if (eindIso && Date.parse(eindIso) !== Date.parse(existing.postnl_eind_werktijd)) velden.postnl_eind_werktijd = eindIso
-    }
+    const eindIso = nieuweEindtijd({
+      gestart: Boolean(existing?.postnl_start_werktijd || velden.postnl_start_werktijd),
+      huidigeEindIso: existing?.postnl_eind_werktijd ?? null,
+      laatsteActieIso: nlTijdstipNaarIso(datum, rit.laatsteActie, new Date(nu).getTime()),
+    })
+    if (eindIso) velden.postnl_eind_werktijd = eindIso
 
     // Diagnostisch loggen: wat las de worker + welke beslissing nam hij voor deze rit.
     const actie = !existing ? 'nieuw'
@@ -495,35 +475,21 @@ async function opslaanMonitorInSupabase(rijen, datum, depotNaam) {
       const opgehaald = r.postnl_monitor_opgehaald ? new Date(r.postnl_monitor_opgehaald).getTime() : 0
       if ((Date.now() - opgehaald) / 60000 < AFWEZIG_DREMPEL_MIN) continue
 
-      // Eindtijd: NIET het detectiemoment (dat ligt ≥20 min ná het echte einde),
-      // maar PostNL's eigen "Tijdstip laatste actie" — de laatste bezorghandeling
-      // van de chauffeur. "Niet in de toekomst" wordt al binnen nlTijdstipNaarIso()
-      // zelf afgedwongen; hier blijft alleen de "niet vóór de starttijd"-check over
-      // (die kent de functie zelf niet). Onplausibel → terugval op laatst-gezien-tijd.
-      const laatsteActieIso = nlTijdstipNaarIso(datum, r.postnl_laatste_actie, new Date(nu).getTime())
-      const actieMs = laatsteActieIso ? new Date(laatsteActieIso).getTime() : null
-      // Plausibiliteitcheck: shift_tijden is de echte begintijd. postnl_start_werktijd
-      // is alleen een "eerste detectie"-markering en kan uren ná de echte start liggen
-      // (rit al klaar bij eerste polling — zie rit #647). Gebruik shiftMap als primaire
-      // startMs; val terug op postnl_start_werktijd als er geen shift-data is.
-      // Reserve-ritten (isReserveRitnummer) slaan de shiftMap-lookup bewust over: het
-      // eerste ritnummer-cijfer van een 4-cijferig reserve-ritnummer kan toevallig
-      // binnen een echte shift 1-6 vallen en zou dan diens begintijd lenen — voor
-      // reserve-ritten is postnl_start_werktijd zelf al de juiste bron (door
-      // opslaanMonitorInSupabase hierboven gevuld met de eerste "laatste actie"-tijd,
-      // niet het detectiemoment).
-      const shiftNrVerdwenen = isReserveRitnummer(r.ritnummer) ? null : Number(String(r.ritnummer).charAt(0))
-      const shiftTijdStrVerdwenen = shiftNrVerdwenen ? shiftMap.get(shiftNrVerdwenen) : null
-      const shiftIsoVerdwenen = shiftTijdStrVerdwenen ? shiftTijdNaarIso(datum, shiftTijdStrVerdwenen) : null
-      const startMs = shiftIsoVerdwenen
-        ? new Date(shiftIsoVerdwenen).getTime()
-        : (r.postnl_start_werktijd ? new Date(r.postnl_start_werktijd).getTime() : null)
-      const actiePlausibel = actieMs !== null && (startMs === null || actieMs >= startMs)
-      const eindtijd = actiePlausibel ? laatsteActieIso : (r.postnl_monitor_opgehaald || nu)
+      // Eindtijd: de continue update hierboven heeft de laatste registratie al
+      // opgeslagen; hier alleen nog aanvullen als dat om wat voor reden niet gebeurd is.
+      // Nooit een zelf afgeleide tijd (vroeger: het moment waarop we de rit het laatst
+      // zagen, als de registratie "onplausibel" leek) — de eindtijd bepaalt de
+      // uitbetaling en is uitsluitend wat PostNL registreerde. Is er geen registratie,
+      // dan blijft hij leeg en valt het op in Financiën.
+      const eindIso = nieuweEindtijd({
+        gestart: true,
+        huidigeEindIso: r.postnl_eind_werktijd,
+        laatsteActieIso: nlTijdstipNaarIso(datum, r.postnl_laatste_actie, new Date(nu).getTime()),
+      })
 
       teUpdaten.push({ id: r.id, velden: {
         status: 'gereden',
-        postnl_eind_werktijd: eindtijd,
+        ...(eindIso && { postnl_eind_werktijd: eindIso }),
         postnl_monitor_opgehaald: nu,
       } })
       logRijen.push({
